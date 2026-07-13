@@ -1,0 +1,11 @@
+{
+  "fixture": "p22_error_context_dynsql",
+  "$comment": "DESIGN.md §20.3.1 point 6: a manifest may exclude a column/field from comparison for a specific pass only by citing a §21 caveat id. C10 makes every pass step over the dynamic EXEC(@s), so all three passes re-materialize (§10.7) and exempt this field identically -- no 'passes' filter needed (applies everywhere, the p10/p24 convention).",
+  "exemptions": [
+    {
+      "field": "Num",
+      "caveatId": "C21",
+      "reason": "The dynamic child batch is an indirect ERROR_*() consumer reached from an active error context (§10.7); its ERROR_NUMBER() reads RAISERROR's own 50000 on every pass (C10 means there is no exact pass for this fixture at all). Expected: native=8134 (fact 7: dynamic SQL invoked from a CATCH block sees the real error), debugger=50000 on Over/Into/boost alike."
+    }
+  ]
+}

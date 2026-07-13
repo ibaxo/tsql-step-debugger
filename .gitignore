@@ -1,0 +1,29 @@
+# .NET
+bin/
+obj/
+*.user
+
+# Node / extension
+node_modules/
+dist/
+
+# M7 packaging (DESIGN.md §7): the built VSIX is scripts/package-vsix.ps1's output,
+# never checked in -- rebuild it from the checkout with that script.
+*.vsix
+
+# Adapter trace logs (DESIGN.md §19) and local test connection strings — never commit
+*.jsonl
+.env
+
+# targets.json is real allowlist config, never the example — don't accidentally commit it
+/targets.json
+
+# Kept locally, not published yet
+/docs/
+/CLAUDE.md
+/.claude/
+
+# Editor
+.vs/
+.vscode/*
+!.vscode/extensions.json

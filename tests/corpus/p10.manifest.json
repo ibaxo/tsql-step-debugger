@@ -1,0 +1,11 @@
+{
+  "fixture": "p10_table_variable",
+  "$comment": "DESIGN.md §20.3.1 point 6: a manifest may exclude a column/field from comparison for a specific pass only by citing a §21 caveat id. This is the first *.manifest.json in the corpus (§20.3.1.6's mechanism had never been exercised before this fixture, per the M3->M4 gate ruling docs/archive/reviews/m3-gate-review-fable.md §3).",
+  "exemptions": [
+    {
+      "field": "AfterRollback",
+      "caveatId": "C25",
+      "reason": "Table variable contents after a debuggee ROLLBACK read empty under the debugger (its #temp realization, R1, is transactional); native preserves them (table variables are non-transactional, fact 2). Expected values: native=3 (2 seeded + the 999 inserted before the rollback survives), debugger=0 (the realization is re-created empty at the detached edge, D8). This is a documented, by-design divergence, not a bug — see DESIGN.md §21 row C25."
+    }
+  ]
+}

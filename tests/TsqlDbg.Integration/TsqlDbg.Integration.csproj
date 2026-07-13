@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="xunit" Version="2.5.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\TsqlDbg.Core\TsqlDbg.Core.csproj" />
+    <!-- M6 item 6 (organizer-review follow-up): adapter-level boost-refusal live
+         tests spawn the REAL compiled adapter over stdio (the M1-M5 smoke-trace
+         pattern, now also an automated pin). Referencing the exe project copies
+         TsqlDbg.Adapter.dll + its runtimeconfig/deps alongside this project's own
+         output so DapStdioHarness can locate it via AppContext.BaseDirectory. -->
+    <ProjectReference Include="..\..\src\TsqlDbg.Adapter\TsqlDbg.Adapter.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- DESIGN.md §20.4 corpus fixtures, needed at test run time to deploy fixtures.
+         §20.3.1.6 manifest files (pNN.manifest.json) ride alongside. -->
+    <None Include="..\corpus\**\*.sql;..\corpus\**\*.manifest.json">
+      <Link>corpus\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!-- M6 item 6 (organizer-review follow-up): the adapter-level boost-refusal live
+         tests launch through the REAL adapter, which enforces DESIGN §4 step 1's
+         targets.json policy gate, unlike the rest of this suite (which calls
+         SessionHost.RunAsync directly and never goes through TargetsPolicy at all). -->
+    <None Include="..\..\targets.json">
+      <Link>targets.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,179 @@
+name: Build & Publish Extension
+
+# Manually-triggered release pipeline ("Run workflow" button, or `gh workflow run publish.yml`).
+# Builds a platform-specific VSIX for Windows, Linux and (optionally) macOS, attaches them all
+# to a GitHub pre-release for manual install, and publishes ONLY the Windows build to the VS Code
+# Marketplace. Default is a dry run (build + upload artifacts, nothing published) so the first
+# click cannot surprise you.
+#
+# Real run (dry_run unchecked): build finishes, then the `publish` job PAUSES for a manual
+# approval before anything goes public. During the pause, open the run, download the Windows VSIX
+# from its "Artifacts" section, sideload + test it, then approve to release. Publish + GitHub
+# release follow the approval.
+#
+# The pause needs a one-time setup: create an Environment named `marketplace`
+# (repo Settings -> Environments -> New environment) with yourself as a Required reviewer.
+# Without that environment the job still runs, just without pausing.
+#
+# Requires one secret for the Marketplace step: VSCE_PAT -- an Azure DevOps Personal Access Token
+# with Marketplace > Manage, scoped to the `ibaxo` publisher (a repo secret, or scope it to the
+# `marketplace` environment for extra safety). Dry runs don't need it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override (e.g. 0.0.1). Blank = use the version in extension/package.json."
+        required: false
+        type: string
+      dry_run:
+        description: "Dry run: build & upload artifacts only. Uncheck to arm the approval gate, then publish Windows to the Marketplace and cut the GitHub release."
+        required: false
+        default: true
+        type: boolean
+      build_mac:
+        description: "Also build the macOS (darwin-arm64) VSIX. Off until there is a Mac to validate it."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write # the release job creates a tag + GitHub Release and uploads the VSIX assets
+
+concurrency:
+  group: publish-extension
+  cancel-in-progress: false
+
+jobs:
+  # Emit the build matrix from the inputs. Windows + Linux always build; macOS only when asked.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        shell: bash
+        run: |
+          include='[{"name":"windows","os":"windows-latest","rid":"win-x64","target":"win32-x64"},{"name":"linux","os":"ubuntu-latest","rid":"linux-x64","target":"linux-x64"}]'
+          if [ "${{ github.event.inputs.build_mac }}" = "true" ]; then
+            include=$(printf '%s' "$include" | jq -c '. + [{"name":"macos","os":"macos-latest","rid":"osx-arm64","target":"darwin-arm64"}]')
+          fi
+          echo "matrix={\"include\":$include}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
+      - name: Apply version override
+        if: ${{ github.event.inputs.version != '' }}
+        working-directory: extension
+        shell: bash
+        run: npm version "${{ github.event.inputs.version }}" --no-git-tag-version --allow-same-version
+
+      # Cross-publish is fine, but each target builds on its native runner so the Unix executable
+      # bit and any per-RID native bits are produced correctly.
+      - name: Publish self-contained adapter (${{ matrix.rid }})
+        shell: bash
+        run: >
+          dotnet publish src/TsqlDbg.Adapter -c Release
+          -r ${{ matrix.rid }} --self-contained
+          -o extension/bin/${{ matrix.rid }}
+
+      - name: Build extension bundle
+        working-directory: extension
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package VSIX (${{ matrix.target }})
+        working-directory: extension
+        shell: bash
+        run: npx vsce package --target ${{ matrix.target }} --out "../tsql-step-debugger-${{ matrix.target }}.vsix"
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: vsix-${{ matrix.target }}
+          path: tsql-step-debugger-${{ matrix.target }}.vsix
+          if-no-files-found: error
+
+  # Manual approval gate + Marketplace publish. Real runs only. `environment: marketplace` makes
+  # this job WAIT for a required reviewer's approval -- that is the pause where you download and
+  # test the Windows VSIX (from the build's Artifacts) before anything is published. It then
+  # publishes the exact bytes that were built and attached.
+  publish:
+    needs: build
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    environment: marketplace
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
+      - name: Download Windows VSIX
+        uses: actions/download-artifact@v7
+        with:
+          name: vsix-win32-x64
+          path: vsix
+
+      - name: Publish Windows build to the VS Code Marketplace
+        shell: bash
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx --yes @vscode/vsce@3 publish --packagePath vsix/tsql-step-debugger-win32-x64.vsix
+
+  # Collect every built VSIX and publish them as a single GitHub pre-release for manual install.
+  # Runs after `publish`, so it is behind the same approval gate. Real runs only.
+  release:
+    needs: [build, publish]
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve version
+        id: v
+        working-directory: extension
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Download all VSIX artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist-vsix
+          pattern: vsix-*
+          merge-multiple: true
+
+      - name: Create / update GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="v${{ steps.v.outputs.version }}"
+          NOTES="Pre-release build. The Windows build is published to the VS Code Marketplace; the Linux and macOS VSIXs are attached here for manual install (\`code --install-extension <file>.vsix\`)."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist-vsix/*.vsix --clobber
+          else
+            gh release create "$TAG" dist-vsix/*.vsix --title "$TAG" --notes "$NOTES" --prerelease
+          fi

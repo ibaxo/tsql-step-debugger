@@ -1,0 +1,13 @@
+{
+  "targets": {
+    "DEVSQL01": {
+      "env": "dev",
+      "allowWrites": true,
+      "options": "TrustServerCertificate=True"
+    },
+    "STAGESQL01": {
+      "env": "staging",
+      "allowWrites": false
+    }
+  }
+}

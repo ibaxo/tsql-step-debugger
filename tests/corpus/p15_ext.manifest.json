@@ -1,0 +1,12 @@
+{
+  "fixture": "p15_ext_scope_identity_frames",
+  "$comment": "DESIGN.md §20.3.1 point 6: a manifest may exclude a field from comparison by citing a §21 caveat id. Third corpus manifest (after p10/C25, p24/C24). Exercises C26 (fact 31a) as a per-pass value skew — the optional 'passes' array (design note §3 preamble) limits the exemption to the Into pass.",
+  "exemptions": [
+    {
+      "field": "AtIdentity0",
+      "caveatId": "C26",
+      "reason": "@@IDENTITY read after a step-INTO of a callee that inserts nothing. On the Into pass the debugger pushes a state-table seed INSERT (a non-identity insert) which resets the session-global @@IDENTITY to NULL (fact 31a), where native execution of the stepped module leaves the caller's value (100). SCOPE_IDENTITY() is kept faithful by the §7.4 chain-sync flag (A26); @@IDENTITY is deliberately NOT shadowed (design note §1.5). Expected: native=100, debugger(Into)=NULL. Over/boost step over the EXEC (no push seed) so @@IDENTITY matches natively there. See DESIGN.md §21 row C26.",
+      "passes": ["into"]
+    }
+  ]
+}

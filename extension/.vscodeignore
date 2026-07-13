@@ -1,0 +1,11 @@
+# DESIGN.md §7/D7 packaging: ship only what the extension needs at runtime.
+# The extension bundle is dist/extension.js (esbuild, --external:vscode, no
+# node_modules needed at runtime) plus the self-contained adapter payload the
+# packaging script publishes into bin/win-x64/ before `vsce package` runs.
+.vscodeignore
+src/**
+tsconfig.json
+node_modules/**
+*.vsix
+.gitignore
+icon_1024x1024.png

@@ -1,0 +1,11 @@
+{
+  "fixture": "p24_post_rollback_write_skew",
+  "$comment": "DESIGN.md §20.3.1 point 6: a manifest may exclude a column/field from comparison for a specific pass only by citing a §21 caveat id. Second manifest in the corpus (after p10.manifest.json/C25) — this one exercises C24 as originally envisioned: a pure value skew, field-exemptable.",
+  "exemptions": [
+    {
+      "field": "TrancountAfterWrite",
+      "caveatId": "C24",
+      "reason": "After the debuggee's own ROLLBACK exits a doomed transaction, @@TRANCOUNT stays faithful to native (0) only until the first statement requiring rollback protection. From that statement onward it reads +1 vs native, because the debugger's safety net (§16) re-opens its own transaction right before the write (deferred resurrection, A9), where native has nothing open (autocommit). Expected values: native=0, debugger=1. Documented, by-design divergence — see DESIGN.md §21 row C24."
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "fixture": "p21_error_context_callee",
+  "$comment": "DESIGN.md §20.3.1 point 6: a manifest may exclude a column/field from comparison for a specific pass only by citing a §21 caveat id. C21's exact-vs-exempted split (§20.4's own words): the Into pass is exact (R7 direct substitution inside the pushed logger frame, dynamic extent, §10.2); the Over/boost passes re-materialize (§10.7) since p21_logger is an indirect ERROR_*() consumer stepped over from an active error context, exempting the wrapper-reflecting trio. Uses the per-pass 'passes' filter (design note §3 preamble, first exercised by p15_ext.manifest.json).",
+  "exemptions": [
+    {
+      "field": "ErrNumber",
+      "caveatId": "C21",
+      "reason": "Re-materialized indirect consumers read RAISERROR's own number, 50000, instead of the original fault's 8134. Expected: native=8134, debugger(over/boost)=50000.",
+      "passes": ["over", "boost"]
+    },
+    {
+      "field": "ErrLine",
+      "caveatId": "C21",
+      "reason": "Re-materialized indirect consumers read the wrapper RAISERROR's own line inside the composed batch, not the original fault site's line -- a real, asserted divergence (deliberately not pinned to a specific composed-batch line number, which is an internal implementation detail with no fidelity meaning of its own).",
+      "passes": ["over", "boost"]
+    },
+    {
+      "field": "ErrProcedure",
+      "caveatId": "C21",
+      "reason": "Re-materialized indirect consumers read NULL (the wrapper RAISERROR executes in an ad-hoc composed batch, no module identity) instead of the original fault site's module name. Expected: native='dbo.p21_error_context_callee' (schema-qualified, fact 31c/D2), debugger(over/boost)=NULL.",
+      "passes": ["over", "boost"]
+    }
+  ]
+}
