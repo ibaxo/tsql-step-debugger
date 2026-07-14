@@ -40,8 +40,9 @@ you can step through real logic on a dev/test database without leaving anything 
 ## Debugging a T-SQL script
 
 The **▷ Debug T-SQL Script** button and **F5** both debug the active `.sql` file with no
-`launch.json` at all — script mode is the default. To pin the settings in a config, add a
-`launch.json` entry; here is the script configuration with **every option at its default**:
+`launch.json` at all — script mode is the default. Add a `launch.json` entry when you want to
+tweak an option; *Run and Debug → create a launch.json file* generates exactly this, which
+behaves identically to the button, with **every option at its default**:
 
 ```json
 {
@@ -50,21 +51,14 @@ The **▷ Debug T-SQL Script** button and **F5** both debug the active `.sql` fi
   "name": "Debug T-SQL script",
   "mode": "script",
   "script": "${file}",
-  "server": "",
-  "database": "",
-  "authType": "integrated",
-  "sqlUser": "",
-  "encrypt": false,
-  "options": "",
   "stopOnEntry": true,
   "commitMode": "rollback",
   "waitfor": "skip",
   "boost": false,
   "allowConsoleWrites": true,
   "executeAs": null,
-  "compatLevel": 150,
+  "compatLevel": 0,
   "logLevel": "normal",
-  "targetsFile": "${workspaceFolder}/targets.json",
   "sourceMap": [],
   "commandTimeoutSec": 300,
   "consoleTimeoutSec": 30,
@@ -76,17 +70,18 @@ The **▷ Debug T-SQL Script** button and **F5** both debug the active `.sql` fi
 }
 ```
 
-You *can* set `server`/`database`/`authType`/`sqlUser` here, but the **Connection Manager**
-is the recommended place: leave them blank to pick a saved connection at launch. There is no
-`password` field by design — SQL passwords live in VS Code SecretStorage, never in
-`launch.json`. Every option is described in the [Configuration reference](#configuration-reference).
+The connection is deliberately absent: with no `server` in the config you pick a saved
+connection from the **Connection Manager** at launch, which is where server, database, auth
+type and login belong. You *can* pin `server`/`database`/`authType`/`sqlUser`/`encrypt`/
+`options` here (CI, or a config you never want to prompt), but there is no `password` field by
+design — SQL passwords live in VS Code SecretStorage, never in `launch.json`. Every option is
+described in the [Configuration reference](#configuration-reference).
 
 ## Debugging a stored procedure
 
-To debug a **deployed procedure** instead of a script, add a `launch.json` entry
-(Run and Debug → *create a launch.json file*) with `mode: "procedure"` — shown here with
-**every option at its default** (`procedure` and `args` are the procedure-mode fields that
-replace `script`):
+To debug a **deployed procedure** instead of a script, add a `launch.json` entry with
+`mode: "procedure"` — shown here with **every option at its default** (`procedure` and `args`
+are the procedure-mode fields that replace `script`):
 
 ```json
 {
@@ -96,21 +91,14 @@ replace `script`):
   "mode": "procedure",
   "procedure": "dbo.MyProcedure",
   "args": { "@OrderId": "42", "@Mode": "N'FULL'" },
-  "server": "",
-  "database": "",
-  "authType": "integrated",
-  "sqlUser": "",
-  "encrypt": false,
-  "options": "",
   "stopOnEntry": true,
   "commitMode": "rollback",
   "waitfor": "skip",
   "boost": false,
   "allowConsoleWrites": true,
   "executeAs": null,
-  "compatLevel": 150,
+  "compatLevel": 0,
   "logLevel": "normal",
-  "targetsFile": "${workspaceFolder}/targets.json",
   "sourceMap": [],
   "commandTimeoutSec": 300,
   "consoleTimeoutSec": 30,
@@ -123,8 +111,8 @@ replace `script`):
 ```
 
 `procedure` is a two/three-part name (required); `args` maps each parameter to a **T-SQL
-literal** — note `N'…'` for Unicode — and defaults to `{}`. Leave `server`/`database` blank
-to pick a saved connection at launch.
+literal** — note `N'…'` for Unicode — and defaults to `{}`. The connection comes from the
+Connection Manager here too.
 
 ## Configuration reference
 
@@ -134,7 +122,7 @@ for procedure mode) really matters; the rest have sensible defaults.
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `mode` | `script` \| `procedure` | `script` | Debug the active `.sql` file, or a deployed module. |
-| `server` / `database` | string | *(pick at launch)* | Omit to choose a saved connection (Connection Manager). |
+| `server` / `database` | string | *(pick at launch)* | Omit (recommended) to choose a saved connection (Connection Manager). |
 | `script` | string | `${file}` | The `.sql` file to debug (script mode). |
 | `procedure` | string | — | Two/three-part name; required for `mode: procedure`. |
 | `args` | object | `{}` | Parameter → T-SQL literal, e.g. `{ "@Id": "42" }` (procedure mode). |
@@ -143,13 +131,13 @@ for procedure mode) really matters; the rest have sensible defaults.
 | `authType` | `integrated` \| `sql` | `integrated` | Windows (SSPI) or a SQL login. Best set in the Connection Manager. |
 | `sqlUser` | string | — | SQL login name (when `authType: sql`). The **password is never a config field** — it lives in SecretStorage; set it in the Connection Manager. |
 | `encrypt` / `options` | boolean / string | `false` / — | `encrypt` = `Encrypt=Mandatory`; `options` appends a raw connection-string fragment. |
-| `targetsFile` | string | `${workspaceFolder}/targets.json` | Optional per-server metadata (`env`, connection `options`). |
+| `targetsFile` | string | *(`MSSQL_DEBUG_TARGETS`, else `${workspaceFolder}/targets.json`)* | Optional per-server metadata (`env`, connection `options`). |
 | `boost` | boolean | `false` | Run whole `IF`/`WHILE` blocks as one batch under Continue (faster, less granular). |
 | `waitfor` | `skip` \| `honor` | `skip` | `skip` logs `WAITFOR DELAY/TIME` instead of blocking. |
 | `allowConsoleWrites` | boolean | `true` | Let the Debug Console write (DML/DDL/`SET @x`), not just `SELECT`. |
 | `sourceMap` | string[] | — | Globs binding a module's server definition to your real `.sql` files (breakpoints in called procs). |
 | `executeAs` | string | — | `EXECUTE AS <clause>` at start, `REVERT`ed at end. |
-| `compatLevel` | `150` \| `160` \| `170` | `150` | ScriptDom parser version. |
+| `compatLevel` | `0` \| `150` \| `160` \| `170` | `0` | ScriptDom parser version. `0` = auto-detect from the server (SQL 2019 → `150`, 2022 → `160`, 2025 → `170`). |
 | `logLevel` | `normal` \| `verbose` | `normal` | `verbose` also shows the debugger's own diagnostic notes (NOCOUNT, `GO`-batch, trigger heads-ups). |
 | `commandTimeoutSec` | number | `300` | Per-statement timeout. |
 | `consoleTimeoutSec` | number | `30` | Debug Console timeout. |
