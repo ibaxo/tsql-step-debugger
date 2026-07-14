@@ -100,6 +100,17 @@ public sealed class Session
     private readonly Dictionary<string, bool> _dmlTriggerCache =
         new(StringComparer.OrdinalIgnoreCase);                              // C2 (M7): DML target name -> has triggers
 
+    // A59 (§4 step 2a / §8.1 / §9): the database's user-defined types, loaded on the init
+    // round trip and refreshed after an executed CREATE TYPE / DROP TYPE — a script may
+    // define, across a GO, the type a later batch declares. Table-type STRUCTURE is fetched
+    // on first use and cached for the session (a type cannot change under a live session
+    // without a DDL statement this session executed, which invalidates it).
+    private UserTypeCatalog _userTypes = UserTypeCatalog.Empty;
+    private readonly Dictionary<string, TableTypeDefinition> _tableTypeCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, AliasBaseType> _aliasBaseTypes =
+        new(StringComparer.OrdinalIgnoreCase);          // [schema].[type] -> base type + collation
+
     // ---- M8 (§5.4) multi-batch (GO) script-mode lifecycle (docs/archive/reviews/multibatch-script-design-notes-opus.md)
     private IReadOnlyList<FrameZeroBlueprint>? _batches;                    // one blueprint per batch ITERATION; procedure mode / single-batch script = one element. §5.4/A43: a `GO N` batch is MATERIALIZED N times here (an iteration = the next batch), so the whole boundary machinery below is reused unchanged
     private IReadOnlyList<BatchPosition>? _batchPositions;                  // §5.4/A43: parallel to _batches — the PHYSICAL orientation (which physical batch, which GO N iteration) for the stackTrace annotation, since materialized _batches conflate iterations
@@ -682,7 +693,10 @@ public sealed class Session
             return new SetVariableResult(SetVariableOutcome.Refused, null, null, $"no such variable '{variableName}' in this frame.");
         }
 
-        if (!HasSafeLiteralForm(slot.Declaration.DataTypeSql))
+        // A59 (§8.3): the STORAGE type decides. An alias-typed variable is exactly as
+        // writable as its base type — and its declared name could never pass this test,
+        // nor survive the CONVERT below (fact 34b).
+        if (!HasSafeLiteralForm(slot.Declaration.StorageType))
         {
             return new SetVariableResult(SetVariableOutcome.Refused, null, null,
                 $"'{slot.Declaration.DataTypeSql}' has no safe literal form for setVariable (§8.3) — " +
@@ -724,7 +738,7 @@ public sealed class Session
         var table = StateTableIdentifiers.TableName(frame.Ordinal);
         var column = StateTableIdentifiers.ColumnName(variableName);
         const string parameterName = "@p";
-        var updateText = $"UPDATE {table} SET {column} = CONVERT({slot.Declaration.DataTypeSql}, {parameterName});";
+        var updateText = $"UPDATE {table} SET {column} = CONVERT({slot.Declaration.StorageType}, {parameterName});";
         try
         {
             await ExecuteAndTraceAsync(updateText, new List<BatchParameter> { new(parameterName, value) }, cancellationToken)
@@ -1060,6 +1074,13 @@ public sealed class Session
             _rewriteContext.TempNames = savedTempNames;
             _tempNameScope.EvaluationFrameOrdinal = null;
         }
+
+        // A59 (fact 34h): a console statement that passes a TVP argument materializes it the
+        // same way an interpreted one does — and moves the identity chain the same way. The
+        // REPL does not go through ComposeDebuggeeBatch (it is debugger-initiated), so it
+        // poisons the chain here; without it, the NEXT debuggee statement's SCOPE_IDENTITY()
+        // capture would silently read the console's bookkeeping INSERT.
+        NoteIdentityChainMove(composedBatch);
 
         BatchResult batchResult;
         try
@@ -1488,13 +1509,21 @@ public sealed class Session
         // the documented NOCOUNT flag; SESSIONPROPERTY has no 'NOCOUNT' option at all
         // (verified: it only covers ANSI_NULLS/ANSI_PADDING/ANSI_WARNINGS/ARITHABORT/
         // CONCAT_NULL_YIELDS_NULL/NUMERIC_ROUNDABORT/QUOTED_IDENTIFIER).
+        // A59 (§4 step 2a): the user-type catalog rides THE SAME round trip, for exactly the
+        // reason above — a separate one would shift every scripted init sequence in §20.2. A
+        // fake that scripts only the NOCOUNT set yields an empty catalog (no user types),
+        // which is the correct answer for every pre-A59 test.
         var initResult = await ExecuteAndTraceAsync(
             "SELECT CASE WHEN (@@OPTIONS & 512) <> 0 THEN 1 ELSE 0 END AS nocount_on; " +
-            "SET XACT_ABORT OFF; SET NOCOUNT ON;", cancellationToken).ConfigureAwait(false);
+            "SET XACT_ABORT OFF; SET NOCOUNT ON; " + UserTypeCatalog.Query, cancellationToken).ConfigureAwait(false);
         if (initResult.ResultSets is [{ Rows: [var noCountRow, ..] }, ..] && Convert.ToInt32(noCountRow[0]) == 0)
         {
             NoteNoCountOnce();   // A56: routed to the logLevel-gated diagnostic channel, not _launchWarnings
         }
+
+        _userTypes = UserTypeCatalog.FromResultSet(
+            initResult.ResultSets.Count > 1 ? initResult.ResultSets[1] : null);
+        _trace.Event("usertypes.load", $"count={_userTypes.Count}");
 
         // DESIGN §16/C4: optional ownership-chaining impersonation, emitted right
         // after step 2 and BEFORE frame-0 resolution (step 3) — EXECUTE AS changes the
@@ -2022,12 +2051,34 @@ public sealed class Session
         _captureDoomedTemps = true;
         try
         {
-            return build();
+            var batch = build();
+            NoteIdentityChainMove(batch);
+            return batch;
         }
         finally
         {
             _captureDoomedTemps = false;
         }
+    }
+
+    // A59 (§7.4/§9, fact 34h): the batch's §9 preamble INSERTed into a table variable that has
+    // an IDENTITY column, which moves the connection's identity chain — SCOPE_IDENTITY()
+    // included (probed: it overwrote a real table's value). The post-statement capture would
+    // therefore read the DEBUGGER's insert, not the debuggee's, for any statement that did not
+    // itself insert an identity — so poison the A26/D1 chain and let the R6 shadow keep serving
+    // its client-modeled value. This is the same flag, and the same recovery, a frame pop uses:
+    // ObserveDebuggeeSuccess re-synchronizes on the next completed insert-family statement,
+    // whose own insert lands LAST and is therefore native truth. (@@IDENTITY is served live and
+    // never rewritten — its perturbation by the same INSERT is caveat C26, not fixable here.)
+    private void NoteIdentityChainMove(Batches.ComposedBatch batch)
+    {
+        if (!batch.MovesIdentityChain || _scopeChainPoisoned)
+        {
+            return;
+        }
+
+        _scopeChainPoisoned = true;
+        _trace.Event("scopeid.poison", "tvp-materialization moved the identity chain (§9/A59, fact 34h)");
     }
 
     // §10.4 A14 (ratified 2026-07-06 — docs/archive/reviews/m4-c23-doom-temp-severity-fable.md
@@ -2378,7 +2429,8 @@ public sealed class Session
         }
 
         var gate = new BoostSessionGate(_doomed, _detached, _broken, _errorContexts.Count > 0, _scopeChainPoisoned);
-        var planResult = BoostPlanner.TryPlan(current, frame.Cursor.Index, gate, isBlocked ?? (_ => false));
+        var planResult = BoostPlanner.TryPlan(
+            current, frame.Cursor.Index, gate, isBlocked ?? (_ => false), frame.TableTypeVariables.Keys);
         if (!planResult.Eligible)
         {
             _trace.Event("boost.refuse",
@@ -3509,11 +3561,17 @@ public sealed class Session
 
         _currentBatchIndex = index;
 
+        // A59 (§4 step 2a): re-read the type catalog iff this batch names a type. A previous
+        // batch may have created it — including via EXEC('CREATE TYPE …'), the conditional-
+        // create idiom, which is invisible to any DDL-triggered refresh.
+        await RefreshUserTypesIfFrameDeclaresThemAsync(blueprint.Parameters, cursor.Index, cancellationToken)
+            .ConfigureAwait(false);
+
         // Declaration hoisting (fact 14) — each batch declares ONLY its own catalog, so a
         // later batch re-DECLAREing a name (even at a different type) just works, and a
         // reference to a prior batch's variable composes a batch whose preamble omits it
         // → native error 137, reproducing the GO scope reset structurally (§5.4).
-        RegisterFrameVariables(frame, blueprint.Parameters);
+        await RegisterFrameVariablesAsync(frame, blueprint.Parameters, cancellationToken).ConfigureAwait(false);
 
         await EnsureCursorDefaultIsGlobalAsync(cursor.Index, cancellationToken).ConfigureAwait(false);
 
@@ -4229,8 +4287,11 @@ public sealed class Session
     private static bool IsProvablyNVarchar(ScalarExpression expression, Frame frame) => expression switch
     {
         StringLiteral literal => literal.IsNational,
+        // A59 (§8.1): the STORAGE type, not the declared one — `CREATE TYPE dbo.SqlText FROM
+        // nvarchar(max)` IS national, and reading the declared name ('dbo.SqlText') would fail
+        // the test and silently demote A58 step-into to step-over.
         VariableReference variable => frame.Variables.TryGet(variable.Name, out var slot)
-                                      && IsNationalTypeSql(slot.Declaration.DataTypeSql),
+                                      && IsNationalTypeSql(slot.Declaration.StorageType),
         _ => false,
     };
 
@@ -4468,10 +4529,22 @@ public sealed class Session
 
         try
         {
-            RegisterFrameVariables(callee, calleeDeclarations);
+            // A59 (§4 step 2a): same rule as a batch entry — a caller statement earlier in
+            // THIS batch may have created the type this callee declares (`EXEC('CREATE TYPE …')`
+            // then `EXEC dbo.UsesIt`), which natively compiles fine at call time.
+            await RefreshUserTypesIfFrameDeclaresThemAsync(
+                calleeDeclarations, calleeCursor.Index, cancellationToken).ConfigureAwait(false);
+            await RegisterFrameVariablesAsync(callee, calleeDeclarations, cancellationToken).ConfigureAwait(false);
         }
         catch (DuplicateVariableException ex)
         {
+            messages.Add($"Cannot step into '{plan.DisplayName}': {ex.Message} — stepping over.");
+            return null;
+        }
+        catch (UnsupportedVariableTypeException ex)
+        {
+            // A59 (§8.2): a CLR-typed local in the callee body. Step over it — the engine
+            // runs the module natively, exactly as it does for every other C8/C9 refusal.
             messages.Add($"Cannot step into '{plan.DisplayName}': {ex.Message} — stepping over.");
             return null;
         }
@@ -4550,13 +4623,22 @@ public sealed class Session
     /// <summary>Parameters first, then body DECLAREs in source order (§8.2 hoisting,
     /// fact 14) — shared by frame 0 init and §11.3 pushes. Table-variable DECLAREs are
     /// not scalar variables (their realization is the §9 registry's, D7).</summary>
-    private static void RegisterFrameVariables(Frame frame, IReadOnlyList<VariableDeclaration> parameters)
+    // DESIGN §8.2 (A59): registration is where a user-defined type is finally pinned down.
+    // `DECLARE @t dbo.X` says nothing about whether dbo.X is an alias scalar, a table type,
+    // or an assembly type (fact 34) — only the §4 step-2a catalog does, and only the server
+    // can hand back the alias's base type (fact 34d). So the split happens HERE, at frame
+    // init, not at parse time:
+    //   • table type    → NOT a scalar variable at all. No state-table column, no preamble
+    //                     DECLARE; registered as a table variable and realized like one (§9).
+    //   • alias type    → a scalar whose STORAGE type is the resolved base type (§8.1).
+    //   • assembly type → refused by name (a launch refusal at frame 0; a step-into refusal,
+    //                     hence a step-OVER, at a callee push) rather than the raw 2715 it
+    //                     used to produce.
+    //   • anything else → registered exactly as before A59.
+    private async Task RegisterFrameVariablesAsync(
+        Frame frame, IReadOnlyList<VariableDeclaration> parameters, CancellationToken cancellationToken)
     {
-        foreach (var declaration in parameters)
-        {
-            frame.Variables.Register(declaration);
-        }
-
+        var declarations = new List<VariableDeclaration>(parameters);
         foreach (var unit in frame.Cursor.Index.All)
         {
             if (unit.Kind != SuKind.Declare || unit.SubKind != SuSubKind.General)
@@ -4564,11 +4646,205 @@ public sealed class Session
                 continue;
             }
 
-            foreach (var declaration in VariableDeclaration.Extract((DeclareVariableStatement)unit.Fragment, frame.Cursor.Index.FullScript))
+            declarations.AddRange(
+                VariableDeclaration.Extract((DeclareVariableStatement)unit.Fragment, frame.Cursor.Index.FullScript));
+        }
+
+        // Classify once, then resolve every alias base type the frame needs in ONE describe
+        // round trip (none at all for the overwhelmingly common all-system-types frame).
+        var aliasTypes = new List<UserTypeEntry>();
+        var aliasByDeclaration = new Dictionary<VariableDeclaration, UserTypeEntry>();
+        var tableTypeDeclarations = new List<(VariableDeclaration Declaration, UserTypeEntry Type)>();
+
+        foreach (var declaration in declarations)
+        {
+            if (!_userTypes.TryResolve(declaration.Fragment.DataType, out var entry))
+            {
+                continue;
+            }
+
+            switch (entry.Kind)
+            {
+                case UserTypeKind.Table:
+                    tableTypeDeclarations.Add((declaration, entry));
+                    break;
+
+                case UserTypeKind.Assembly:
+                    throw new UnsupportedVariableTypeException(declaration.Name, declaration.DataTypeSql,
+                        "CLR (assembly) types have no literal form the debugger can store or re-seed");
+
+                case UserTypeKind.Alias:
+                    aliasTypes.Add(entry);
+                    aliasByDeclaration[declaration] = entry;
+                    break;
+            }
+        }
+
+        await EnsureAliasBaseTypesAsync(aliasTypes, cancellationToken).ConfigureAwait(false);
+
+        foreach (var declaration in declarations)
+        {
+            if (tableTypeDeclarations.Any(t => t.Declaration == declaration))
+            {
+                continue;                                  // §8.2: a table, not a scalar
+            }
+
+            if (aliasByDeclaration.TryGetValue(declaration, out var alias))
+            {
+                var resolved = _aliasBaseTypes[alias.QualifiedName];
+                frame.Variables.Register(declaration with
+                {
+                    StorageTypeSql = resolved.TypeSql,
+                    StorageCollation = resolved.Collation,
+                });
+            }
+            else
             {
                 frame.Variables.Register(declaration);
             }
         }
+
+        foreach (var (declaration, entry) in tableTypeDeclarations)
+        {
+            // Mirrors the engine's own duplicate-name rule, which does not care whether the
+            // clashing declarator is scalar or tabular (§8.2).
+            if (frame.Variables.TryGet(declaration.Name, out _)
+                || frame.TableTypeVariables.ContainsKey(declaration.Name))
+            {
+                throw new DuplicateVariableException(declaration.Name);
+            }
+
+            frame.TableTypeVariables.Add(declaration.Name, new TableTypeVariable
+            {
+                Name = declaration.Name,
+                Type = entry,
+                RealizationName = RewriteContext.TableVariablePhysicalName(declaration.Name, frame.Ordinal),
+            });
+        }
+    }
+
+    // A59 (§4 step 2a, corrected): the catalog is re-read at every point where a frame is
+    // ABOUT TO RESOLVE a named type — and nowhere else.
+    //
+    // The first cut refreshed after an executed CREATE TYPE / DROP TYPE, reasoning that a type
+    // created by dynamic SQL "is also not declarable by the surrounding script, which parsed
+    // before it existed". That is FALSE, and the review caught it live: §5.4 parses each batch
+    // at BATCH ENTRY, so
+    //
+    //     IF TYPE_ID('dbo.X') IS NULL EXEC('CREATE TYPE dbo.X FROM int');
+    //     GO
+    //     DECLARE @x dbo.X;                     -- stale catalog → the raw 2715 A59 exists to fix
+    //
+    // died exactly as it did before A59 — and CREATE TYPE cannot sit under an IF, so that
+    // EXEC() is not an exotic shape, it is THE conditional-create idiom (these very fixtures
+    // use it). A stepped-over proc that creates a type has the same hole, and a dynamic
+    // DROP+CREATE redefinition would have kept a stale STRUCTURE behind a name that still
+    // resolved (the A55 stale-module-cache lesson, repeated).
+    //
+    // Refreshing on use closes all three: it cannot go stale by construction, no matter who
+    // created the type or how. The cost is zero for the overwhelmingly common frame that
+    // declares no named type at all — which is the only reason the trigger is worth having.
+    private async Task RefreshUserTypesIfFrameDeclaresThemAsync(
+        IReadOnlyList<VariableDeclaration> parameters, StatementIndex index, CancellationToken cancellationToken)
+    {
+        if (!DeclaresNamedType(parameters, index))
+        {
+            return;
+        }
+
+        await RefreshUserTypeCatalogAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Does this frame name a type anywhere the catalog will be consulted — a scalar
+    /// DECLARE/parameter (§8.2) or a column inside a `DECLARE @t TABLE(…)` (§9, fact 34c)?
+    /// Purely syntactic: <c>UserDataTypeReference</c> is ScriptDom's "not a system type" node,
+    /// so this never needs the catalog to decide whether to read the catalog.</summary>
+    private static bool DeclaresNamedType(IReadOnlyList<VariableDeclaration> parameters, StatementIndex index)
+    {
+        foreach (var parameter in parameters)
+        {
+            if (parameter.Fragment.DataType is UserDataTypeReference)
+            {
+                return true;
+            }
+        }
+
+        foreach (var unit in index.All)
+        {
+            switch (unit)
+            {
+                case { Kind: SuKind.Declare, SubKind: SuSubKind.General, Fragment: DeclareVariableStatement declare }:
+                    if (declare.Declarations.Any(d => d.DataType is UserDataTypeReference))
+                    {
+                        return true;
+                    }
+
+                    break;
+
+                case { SubKind: SuSubKind.TableVarDeclare, Fragment: DeclareTableVariableStatement table }:
+                    if (table.Body?.Definition?.ColumnDefinitions.Any(c => c.DataType is UserDataTypeReference) == true)
+                    {
+                        return true;
+                    }
+
+                    break;
+            }
+        }
+
+        return false;
+    }
+
+    private async Task RefreshUserTypeCatalogAsync(CancellationToken cancellationToken)
+    {
+        var result = await ExecuteAndTraceAsync(UserTypeCatalog.Query, cancellationToken).ConfigureAwait(false);
+        _userTypes = UserTypeCatalog.FromResultSet(result.ResultSets.Count > 0 ? result.ResultSets[0] : null);
+        _aliasBaseTypes.Clear();
+        _tableTypeCache.Clear();
+        _trace.Event("usertypes.refresh", $"count={_userTypes.Count}");
+    }
+
+    // A59 (§8.1): the server formats the base type — one describe call covers every alias
+    // type not already cached (fact 34d). The cache is session-lived and invalidated only by
+    // an executed CREATE/DROP TYPE, the only thing that can change the answer.
+    private async Task EnsureAliasBaseTypesAsync(
+        IReadOnlyList<UserTypeEntry> aliasTypes, CancellationToken cancellationToken)
+    {
+        var missing = aliasTypes
+            .Where(t => !_aliasBaseTypes.ContainsKey(t.QualifiedName))
+            .Distinct()
+            .ToList();
+        if (missing.Count == 0)
+        {
+            return;
+        }
+
+        var result = await ExecuteAndTraceAsync(
+            UserTypeResolution.BuildAliasBaseTypeQuery(missing), cancellationToken).ConfigureAwait(false);
+        var resolved = UserTypeResolution.ParseBaseTypes(result.ResultSets[0], missing.Count);
+        for (var i = 0; i < missing.Count; i++)
+        {
+            _aliasBaseTypes[missing[i].QualifiedName] = resolved[i];
+            _trace.Event("usertypes.alias",
+                $"{missing[i].QualifiedName} -> {resolved[i].TypeSql} collation={resolved[i].Collation ?? "-"}");
+        }
+    }
+
+    // A59 (§9): a table type's structure, rebuilt from the catalog (fact 34f) because — unlike
+    // DECLARE @t TABLE(…) — it is nowhere in the source text. Cached per session.
+    private async Task<TableTypeDefinition> GetTableTypeDefinitionAsync(
+        UserTypeEntry tableType, CancellationToken cancellationToken)
+    {
+        if (_tableTypeCache.TryGetValue(tableType.QualifiedName, out var cached))
+        {
+            return cached;
+        }
+
+        var result = await ExecuteAndTraceAsync(
+            UserTypeResolution.BuildTableTypeQuery(tableType), cancellationToken).ConfigureAwait(false);
+        var definition = UserTypeResolution.ParseTableType(tableType, result.ResultSets);
+        _tableTypeCache[tableType.QualifiedName] = definition;
+        _trace.Event("usertypes.table", $"{tableType.QualifiedName} columns={definition.Columns.Count}");
+        return definition;
     }
 
     // §9/R1 (D7): realizations are hoisted — created empty at frame init (frame 0:
@@ -4590,27 +4866,82 @@ public sealed class Session
             var name = rawName.StartsWith('@') ? rawName : "@" + rawName;
             var definition = declare.Body!.Definition
                 ?? throw new InvalidOperationException($"DECLARE {name} TABLE without a definition.");
-            var span = SourceSpan.Of(definition);
-            var definitionSql = frame.Cursor.Index.FullScript.Substring(span.StartOffset, span.Length).Trim();
-            if (definitionSql.StartsWith('(') && definitionSql.EndsWith(')'))
-            {
-                definitionSql = definitionSql[1..^1];
-            }
+            var definitionSql = await ResolveTableDefinitionSqlAsync(
+                definition, frame.Cursor.Index.FullScript, cancellationToken).ConfigureAwait(false);
 
-            var physical = RewriteContext.TableVariablePhysicalName(name, frame.Ordinal);
-            var bracketed = RewriteContext.BracketIdentifier(physical);
-            var createDdl = $"CREATE TABLE {bracketed} ({definitionSql});";
-            await ExecuteAndTraceAsync(createDdl, cancellationToken).ConfigureAwait(false);
-            frame.TempObjects.Add(new TempObjectEntry
-            {
-                OriginalName = name,
-                PhysicalName = physical,
-                Kind = TempObjectKind.TableVariable,
-                CreatedAtTrancount = createdAtTrancount,
-                RecreateDdl = $"IF OBJECT_ID('tempdb..{physical}') IS NULL {createDdl}",
-                SurvivesBatchBoundary = false,       // M8 (§5.4): table variables die at GO (fact 2)
-            });
+            await RealizeTableVariableAsync(frame, name, definitionSql, createdAtTrancount, cancellationToken)
+                .ConfigureAwait(false);
         }
+
+        // A59 (§8.2/§9): the same realization for a `DECLARE @t dbo.MyTable`, whose shape comes
+        // from the catalog rather than the source. Registration (§8.2) already kept it out of
+        // the variable catalog, so from here on it IS a table variable in every respect.
+        foreach (var (name, tableTypeVariable) in frame.TableTypeVariables)
+        {
+            var definition = await GetTableTypeDefinitionAsync(tableTypeVariable.Type, cancellationToken)
+                .ConfigureAwait(false);
+            tableTypeVariable.InsertableColumns = definition.InsertableColumns;
+            tableTypeVariable.IdentityColumn = definition.IdentityColumn;
+            await RealizeTableVariableAsync(
+                frame, name, definition.BuildColumnDdl(), createdAtTrancount, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task RealizeTableVariableAsync(
+        Frame frame, string name, string definitionSql, int createdAtTrancount, CancellationToken cancellationToken)
+    {
+        var physical = RewriteContext.TableVariablePhysicalName(name, frame.Ordinal);
+        var bracketed = RewriteContext.BracketIdentifier(physical);
+        var createDdl = $"CREATE TABLE {bracketed} ({definitionSql});";
+        await ExecuteAndTraceAsync(createDdl, cancellationToken).ConfigureAwait(false);
+        frame.TempObjects.Add(new TempObjectEntry
+        {
+            OriginalName = name,
+            PhysicalName = physical,
+            Kind = TempObjectKind.TableVariable,
+            CreatedAtTrancount = createdAtTrancount,
+            RecreateDdl = $"IF OBJECT_ID('tempdb..{physical}') IS NULL {createDdl}",
+            SurvivesBatchBoundary = false,       // M8 (§5.4): table variables die at GO (fact 2)
+        });
+    }
+
+    // A59 (§9): `DECLARE @t TABLE(c dbo.Alias, …)` is legal natively (fact 34c) — a table
+    // variable is declared in the current database's context. Its #temp realization is not:
+    // tempdb cannot see the alias type (fact 34a, msg 2715). So the alias type references
+    // INSIDE the definition are span-patched to their base types and everything else in the
+    // slice is left byte-exact, exactly as §5.3 requires.
+    private async Task<string> ResolveTableDefinitionSqlAsync(
+        TableDefinition definition, string fullScript, CancellationToken cancellationToken)
+    {
+        var span = SourceSpan.Of(definition);
+        var aliasColumns = new List<(SourceSpan Span, UserTypeEntry Type)>();
+        foreach (var column in definition.ColumnDefinitions)
+        {
+            if (_userTypes.TryResolve(column.DataType, out var entry) && entry.Kind == UserTypeKind.Alias)
+            {
+                aliasColumns.Add((SourceSpan.Of(column.DataType!), entry));
+            }
+        }
+
+        await EnsureAliasBaseTypesAsync(aliasColumns.Select(c => c.Type).ToList(), cancellationToken)
+            .ConfigureAwait(false);
+
+        var slice = new StringBuilder(fullScript.Substring(span.StartOffset, span.Length));
+        foreach (var (typeSpan, entry) in aliasColumns.OrderByDescending(c => c.Span.StartOffset))
+        {
+            // A COLUMN definition, so it takes the collation form (unlike a CONVERT target).
+            var resolved = _aliasBaseTypes[entry.QualifiedName];
+            var columnType = resolved.Collation is null
+                ? resolved.TypeSql
+                : $"{resolved.TypeSql} COLLATE {resolved.Collation}";
+            slice.Remove(typeSpan.StartOffset - span.StartOffset, typeSpan.Length)
+                 .Insert(typeSpan.StartOffset - span.StartOffset, columnType);
+        }
+
+        var definitionSql = slice.ToString().Trim();
+        return definitionSql.StartsWith('(') && definitionSql.EndsWith(')')
+            ? definitionSql[1..^1]
+            : definitionSql;
     }
 
     // R3 (D7): a DECLARE CURSOR with neither LOCAL nor GLOBAL falls to the database's
@@ -5498,7 +5829,19 @@ public sealed class Session
 
             var hasArg = _options.Args is not null && _options.Args.ContainsKey(name);
             string? initializerSql = null;
-            if (!hasArg && p.Value is { } defaultExpr)
+
+            // A59 (§9): a table-valued parameter has no literal form, so launch `args` cannot
+            // carry one and its absence is not an error. Procedure mode starts it EMPTY — the
+            // realization (§8.2) is created with the type's structure and no rows — and says so.
+            // A TVP formal is READONLY, so the body cannot write it either way.
+            if (_userTypes.TryResolve(p.DataType, out var entry) && entry.Kind == UserTypeKind.Table)
+            {
+                _launchWarnings.Add(
+                    $"{name} is a table-valued parameter of {_options.Procedure}: it starts EMPTY (launch " +
+                    "'args' cannot carry rows). Add rows from the Debug Console, or debug a script that " +
+                    "fills the variable and EXECs the procedure.");
+            }
+            else if (!hasArg && p.Value is { } defaultExpr)
             {
                 var s = SourceSpan.Of(defaultExpr);
                 initializerSql = fullScript.Substring(s.StartOffset, s.Length);

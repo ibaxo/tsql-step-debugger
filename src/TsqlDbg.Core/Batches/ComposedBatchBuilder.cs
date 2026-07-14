@@ -14,7 +14,15 @@ namespace TsqlDbg.Core.Batches;
 // values ride parameters when the state table can't be read usefully or written).
 public sealed record ComposedBatch(
     string Text, int FrameOrdinal, int B, IReadOnlySet<ShadowKind> RequiredShadows,
-    IReadOnlyList<BatchParameter>? Parameters = null);
+    IReadOnlyList<BatchParameter>? Parameters = null)
+{
+    /// <summary>A59 (§9/§7.4, fact 34h): this batch's preamble materializes a table-type
+    /// variable whose type has an IDENTITY column, so the debugger's own INSERT has moved the
+    /// connection's identity chain. The session must poison the A26/D1 scope chain — see
+    /// <see cref="ComposedBatchBuilder.MovesIdentityChain"/>. Init-only and defaulted, so
+    /// every existing positional construction (and its pins) is untouched.</summary>
+    public bool MovesIdentityChain { get; init; }
+}
 
 /// <summary>
 /// M3 (§10) knobs on the §7.1 shell. The M1/M2 shape is <see cref="Default"/>;
@@ -123,7 +131,8 @@ public static class ComposedBatchBuilder
             ?? throw new InvalidOperationException($"{declaration.Name} has no initializer to build a synthetic assignment for.");
         var rewrite = rewriteEngine.Rewrite(initializer, fullScript, rewriteContext);
         var syntheticText = $"SET {declaration.Name} = {rewrite.PatchedText};";
-        return Build(frame, rewriteContext, syntheticText, rewrite.RequiredShadows, shadowValues, composition ?? BatchComposition.Default);
+        return Build(frame, rewriteContext, syntheticText, rewrite.RequiredShadows, shadowValues,
+            composition ?? BatchComposition.Default, CollectTvpArguments(initializer, frame));
     }
 
     public static ComposedBatch BuildForUnit(
@@ -132,7 +141,64 @@ public static class ComposedBatchBuilder
         BatchComposition? composition = null)
     {
         var rewrite = rewriteEngine.Rewrite(unit.Fragment, fullScript, rewriteContext);
-        return Build(frame, rewriteContext, rewrite.PatchedText, rewrite.RequiredShadows, shadowValues, composition ?? BatchComposition.Default);
+        return Build(frame, rewriteContext, rewrite.PatchedText, rewrite.RequiredShadows, shadowValues,
+            composition ?? BatchComposition.Default, CollectTvpArguments(unit.Fragment, frame));
+    }
+
+    /// <summary>
+    /// DESIGN §9 (A59): the frame's table-type variables this fragment references as a scalar
+    /// <c>VariableReference</c> — i.e. passes as a TVP ARGUMENT. Not only `EXEC p @rows = @t`:
+    /// `dbo.f(@t)` inside a DECLARE initializer, an IF/WHILE predicate, a RETURN expression,
+    /// a watch/logpoint expression or a `FROM dbo.tvf(@t)` is the same shape, which is why
+    /// EVERY composed-batch entry point runs this — a batch that references <c>@t</c> without
+    /// declaring it dies with error 137 (batch-aborting: session over), where native runs fine.
+    ///
+    /// A reference to <c>@t</c> as a table is a <c>VariableTableReference</c>, which R1 has
+    /// already rewritten to the realization and which needs no materialization at all — so
+    /// the ordinary `INSERT INTO @t` / `SELECT … FROM @t` statements cost nothing here.
+    /// </summary>
+    public static IReadOnlyList<TableTypeVariable> CollectTvpArguments(TSqlFragment fragment, Frame frame)
+    {
+        if (frame.TableTypeVariables.Count == 0)
+        {
+            return Array.Empty<TableTypeVariable>();
+        }
+
+        var collector = new ScalarVariableCollector();
+        fragment.Accept(collector);
+
+        var arguments = new List<TableTypeVariable>();
+        foreach (var name in collector.Names)
+        {
+            if (frame.TableTypeVariables.TryGetValue(name, out var tvp) && !arguments.Contains(tvp))
+            {
+                arguments.Add(tvp);
+            }
+        }
+
+        return arguments;
+    }
+
+    private sealed class ScalarVariableCollector : TSqlFragmentVisitor
+    {
+        public List<string> Names { get; } = new();
+
+        // A VariableTableReference (`FROM @t`) CONTAINS a VariableReference for its own name,
+        // so descending into one would report every ordinary table-variable read as a TVP
+        // argument — a pointless copy per statement, and a needless @@IDENTITY perturbation
+        // (C26). R1 has already rewritten that reference to the realization; stop here.
+        public override void ExplicitVisit(VariableTableReference node)
+        {
+        }
+
+        public override void Visit(VariableReference node)
+        {
+            if (node.Name is { Length: > 0 } name
+                && !Names.Contains(name, StringComparer.OrdinalIgnoreCase))
+            {
+                Names.Add(name);
+            }
+        }
     }
 
     // DESIGN §6: predicate evaluation and RETURN-value evaluation go "through the
@@ -155,7 +221,8 @@ public static class ComposedBatchBuilder
         var rewrite = rewriteEngine.Rewrite(predicate, fullScript, rewriteContext);
         var text = $"SELECT CASE WHEN {rewrite.PatchedText} THEN 1 ELSE 0 END AS p;";
         return Build(frame, rewriteContext, text, rewrite.RequiredShadows, shadowValues,
-            (composition ?? BatchComposition.Default) with { IncludeStateWrite = false, IncludeStateSnapshot = false });
+            (composition ?? BatchComposition.Default) with { IncludeStateWrite = false, IncludeStateSnapshot = false },
+            CollectTvpArguments(predicate, frame));
     }
 
     // §6 RETURN-value capture (and the natural shell for §12.4 watch / §13 logpoint
@@ -168,7 +235,8 @@ public static class ComposedBatchBuilder
         var rewrite = rewriteEngine.Rewrite(expression, fullScript, rewriteContext);
         var text = $"SELECT ({rewrite.PatchedText}) AS p;";
         return Build(frame, rewriteContext, text, rewrite.RequiredShadows, shadowValues,
-            (composition ?? BatchComposition.Default) with { IncludeStateWrite = false, IncludeStateSnapshot = false });
+            (composition ?? BatchComposition.Default) with { IncludeStateWrite = false, IncludeStateSnapshot = false },
+            CollectTvpArguments(expression, frame));
     }
 
     // M6 G2 (design note §4, A23): logpoints' one-round-trip multi-expression shell —
@@ -183,17 +251,26 @@ public static class ComposedBatchBuilder
     {
         var requiredShadows = new HashSet<ShadowKind>();
         var columns = new List<string>(expressions.Count);
+        var tvpArguments = new List<TableTypeVariable>();
         for (var i = 0; i < expressions.Count; i++)
         {
             var (expression, sourceText) = expressions[i];
             var rewrite = rewriteEngine.Rewrite(expression, sourceText, rewriteContext);
             requiredShadows.UnionWith(rewrite.RequiredShadows);
             columns.Add($"({rewrite.PatchedText}) AS v{i}");
+            foreach (var tvp in CollectTvpArguments(expression, frame))
+            {
+                if (!tvpArguments.Contains(tvp))
+                {
+                    tvpArguments.Add(tvp);       // one materialization covers all N expressions
+                }
+            }
         }
 
         var text = $"SELECT {string.Join(", ", columns)};";
         return Build(frame, rewriteContext, text, requiredShadows, shadowValues,
-            (composition ?? BatchComposition.Default) with { IncludeStateWrite = false, IncludeStateSnapshot = false });
+            (composition ?? BatchComposition.Default) with { IncludeStateWrite = false, IncludeStateSnapshot = false },
+            tvpArguments);
     }
 
     // M5 I6 (§12.3 REPL) + A45 (2026-07-12, docs/archive/reviews/repl-variable-seed-opus.md):
@@ -303,12 +380,22 @@ public static class ComposedBatchBuilder
                     var v = variables[i];
                     var parameterName = SeedParam(nonce, v.Ordinal);
                     parameters.Add(new BatchParameter(parameterName, doomedSeed[i]));
-                    seeds.Add($"{v.Declaration.Name} = CONVERT({v.Declaration.DataTypeSql}, {parameterName})");
+                    // A59 (§8.1): CONVERT takes the STORAGE type — the engine refuses a
+                    // CONVERT to a user-defined alias type outright (fact 34b, msg 243).
+                    seeds.Add($"{v.Declaration.Name} = CONVERT({v.Declaration.StorageType}, {parameterName})");
                 }
 
                 sb.Append("SELECT ").Append(string.Join(", ", seeds)).Append(";\n");
             }
         }
+
+        // A59 (§9/§12.3): a console statement can pass a TVP argument too — same
+        // materialization as the interpreted path, and it moves the identity chain the same
+        // way (fact 34h), so the REPL's caller poisons the scope chain on this flag too. A
+        // debugger-initiated batch must be invisible to the debuggee (D3) — that is exactly
+        // what the poison buys: the shadow keeps serving the client-modeled value.
+        var replTvps = CollectTvpArguments(statement, frame);
+        AppendTvpMaterialization(line => sb.Append(line).Append('\n'), replTvps);
 
         sb.Append("BEGIN TRY\n");
         sb.Append(rewrite.PatchedText.TrimEnd()).Append(rewrite.PatchedText.TrimEnd().EndsWith(';') ? "\n" : ";\n");
@@ -349,7 +436,10 @@ public static class ComposedBatchBuilder
         // __dbg_repl_err marker set), never from the composed-batch line map, so the
         // ComposedBatch.B slot is unused on this path. `parameters` is non-null only for
         // the doomed snapshot seed (§10.4); healthy/detached is a plain language batch.
-        return new ComposedBatch(sb.ToString(), frame.Ordinal, 0, rewrite.RequiredShadows, parameters);
+        return new ComposedBatch(sb.ToString(), frame.Ordinal, 0, rewrite.RequiredShadows, parameters)
+        {
+            MovesIdentityChain = MovesIdentityChain(replTvps),
+        };
     }
 
     // M6 (§14/A21): the boosted-subtree composition — the §7.1 shell around the WHOLE
@@ -373,6 +463,18 @@ public static class ComposedBatchBuilder
         {
             throw new ArgumentException(
                 $"Boost roots are IF/WHILE units only (§14/A21); got {controlNode.SubKind}.", nameof(controlNode));
+        }
+
+        if (CollectTvpArguments(controlNode.Fragment, frame) is { Count: > 0 } tvps)
+        {
+            // A59 (§14/§9): the planner must have refused this subtree. Materializing a TVP
+            // inside a boosted batch would prepend an INSERT into a table variable, which
+            // MOVES the connection's identity chain (fact 34h) — and boost's whole B7
+            // recovery rides the post-block SCOPE_IDENTITY() capture (F2 ruling, fact 26d).
+            // Refusing costs only speed; getting the chain wrong costs correctness.
+            throw new InvalidOperationException(
+                $"Boosted slice passes table-type variable(s) {string.Join(", ", tvps.Select(t => t.Name))} as a " +
+                "scalar — the planner must refuse (§14/A21, A59). Session bug.");
         }
 
         var table = StateTableIdentifiers.TableName(frame.Ordinal);
@@ -453,7 +555,8 @@ public static class ComposedBatchBuilder
     private static ComposedBatch Build(
         Frame frame, RewriteContext ctx, string patchedStatementText,
         IReadOnlySet<ShadowKind> requiredShadows, ShadowValues shadowValues,
-        BatchComposition composition)
+        BatchComposition composition,
+        IReadOnlyList<TableTypeVariable>? tvpArguments = null)
     {
         if (composition is { Rematerialize: not null, DebuggerInitiated: true })
         {
@@ -590,12 +693,16 @@ public static class ComposedBatchBuilder
                     var v = variables[i];
                     var parameterName = SeedParam(nonce, v.Ordinal);
                     parameters.Add(new BatchParameter(parameterName, doomedSeed[i]));
-                    seeds.Add($"{v.Declaration.Name} = CONVERT({v.Declaration.DataTypeSql}, {parameterName})");
+                    // A59 (§8.1): CONVERT takes the STORAGE type — the engine refuses a
+                    // CONVERT to a user-defined alias type outright (fact 34b, msg 243).
+                    seeds.Add($"{v.Declaration.Name} = CONVERT({v.Declaration.StorageType}, {parameterName})");
                 }
 
                 Line($"SELECT {string.Join(", ", seeds)};");
             }
         }
+
+        AppendTvpMaterialization(Line, tvpArguments);
 
         if (composition.BoostSeq is { } boostSeq)
         {
@@ -693,8 +800,61 @@ public static class ComposedBatchBuilder
             Line("SET XACT_ABORT ON;");                        // restore the debuggee's setting
         }
 
-        return new ComposedBatch(sb.ToString(), frame.Ordinal, b, requiredShadows, parameters);
+        return new ComposedBatch(sb.ToString(), frame.Ordinal, b, requiredShadows, parameters)
+        {
+            MovesIdentityChain = tvpArguments is not null && MovesIdentityChain(tvpArguments),
+        };
     }
+
+    // A59 (§9): this statement passes a table-type variable as a TVP argument. A #temp cannot
+    // BE a TVP argument and only a variable of the type can — so declare the real thing and
+    // fill it from the realization, which stays the single source of truth (a TVP formal is
+    // READONLY: nothing to copy back). IDENTITY/computed columns cannot be supplied to a table
+    // variable (fact 34e: SET IDENTITY_INSERT is a syntax error on one), hence C28's
+    // regenerated identity values.
+    //
+    // The ORDER BY is what makes C28's promise — "rows inserted contiguously reproduce their
+    // identity values exactly" — a GUARANTEE and not an accident of the plan: identity is
+    // assigned in insert order, and INSERT…SELECT only fixes that order under an explicit
+    // ORDER BY. Ordering by the realization's own identity column replays the original
+    // insertion order, so a gap-free source reproduces its values byte-for-byte and a gapped
+    // one at least closes its gaps deterministically (C28's documented divergence) instead of
+    // reshuffling the rows.
+    //
+    // ONE source, shared by Build and BuildForRepl — the A59 review's F1 was exactly this
+    // block existing in two places and being wired into only two of seven callers.
+    private static void AppendTvpMaterialization(Action<string> emitLine, IReadOnlyList<TableTypeVariable>? tvpArguments)
+    {
+        foreach (var tvp in tvpArguments ?? Array.Empty<TableTypeVariable>())
+        {
+            emitLine($"DECLARE {tvp.Name} {tvp.Type.QualifiedName};");
+            if (tvp.InsertableColumns.Count == 0)
+            {
+                continue;                    // every column IDENTITY/computed: nothing to supply
+            }
+
+            var columns = string.Join(", ", tvp.InsertableColumns.Select(TableTypeDefinition.Bracket));
+            var order = tvp.IdentityColumn is { } identity
+                ? $" ORDER BY {TableTypeDefinition.Bracket(identity)}"
+                : string.Empty;
+            emitLine($"INSERT INTO {tvp.Name} ({columns}) SELECT {columns} FROM " +
+                     $"{RewriteContext.BracketIdentifier(tvp.RealizationName)}{order};");
+        }
+    }
+
+    /// <summary>
+    /// A59 / engine fact 34h: inserting into a table variable that has an IDENTITY column moves
+    /// the connection's identity chain — <c>SCOPE_IDENTITY()</c> and <c>@@IDENTITY</c> both
+    /// (probed: an insert into a table variable overwrote a real table's SCOPE_IDENTITY). So a
+    /// batch whose §9 preamble materializes such a TVP CANNOT have its post-statement
+    /// SCOPE_IDENTITY() capture trusted: unless the user statement itself performed an identity
+    /// insert (which lands last and is therefore native truth), the capture reads the
+    /// debugger's own bookkeeping INSERT. The session poisons the §7.4/A26 scope chain when
+    /// this is true — the same flag, and the same "shadow keeps its client-modeled value until
+    /// an insert-family statement re-synchronizes" recovery, that a frame pop already uses.
+    /// </summary>
+    public static bool MovesIdentityChain(IReadOnlyList<TableTypeVariable> tvpArguments)
+        => tvpArguments.Any(t => t.IdentityColumn is not null && t.InsertableColumns.Count > 0);
 
     private static int CountLines(string text) => text.Count(c => c == '\n') + 1;
 

@@ -12,12 +12,14 @@ namespace TsqlDbg.Core.Tests.Batches;
 public class BoostPlannerTests
 {
     private static BoostPlanResult Plan(
-        string script, BoostSessionGate? gate = null, Func<StatementUnit, bool>? isBlocked = null)
+        string script, BoostSessionGate? gate = null, Func<StatementUnit, bool>? isBlocked = null,
+        IReadOnlyCollection<string>? tableTypeVariables = null)
     {
         var (body, full) = ParseTestHelper.ParseBatch(script);
         var cursor = ExecutionCursor.Create(body, full);
         var node = cursor.Index.All.First(u => u.SubKind is SuSubKind.If or SuSubKind.While);
-        return BoostPlanner.TryPlan(node, cursor.Index, gate ?? BoostSessionGate.PlainHealthy, isBlocked ?? (_ => false));
+        return BoostPlanner.TryPlan(
+            node, cursor.Index, gate ?? BoostSessionGate.PlainHealthy, isBlocked ?? (_ => false), tableTypeVariables);
     }
 
     // ------------------------------------------------------------------ allowed set
@@ -306,5 +308,41 @@ public class BoostPlannerTests
                 SuSubKind.TableVarDeclare, SuSubKind.CursorDeclare,
             }.OrderBy(k => (int)k).ToArray(),
             refused.OrderBy(k => (int)k).ToArray());
+    }
+
+    // ---------------------------------------------- A59 (§9/§14): table-type scalar reference
+
+    [Theory]
+    // A scalar UDF taking the TVP…
+    [InlineData("WHILE @i < 3\nBEGIN\n    SET @n = dbo.cnt(@t);\n    SET @i = @i + 1;\nEND")]
+    // …a table-valued one…
+    [InlineData("WHILE @i < 3\nBEGIN\n    INSERT dbo.log SELECT * FROM dbo.tvf(@t);\n    SET @i = @i + 1;\nEND")]
+    // …and the boost root's own predicate.
+    [InlineData("IF dbo.cnt(@t) > 1\n    SET @n = 99;")]
+    public void Refuses_ASubtreeThatPassesATableTypeVariableAsATvpArgument(string script)
+    {
+        // Boosting it would need the §9 materialization INSERT in the batch preamble — and an
+        // INSERT into a table variable with an IDENTITY column MOVES the connection's identity
+        // chain (fact 34h), which is precisely the chain boost's post-block SCOPE_IDENTITY()
+        // capture rides (fact 26d). Interpreted mode materializes it and poisons the chain
+        // deliberately; a boosted slice cannot, because afterwards its own in-slice inserts and
+        // the preamble insert are indistinguishable. Conservative-closed: refusal costs speed.
+        var result = Plan(script, tableTypeVariables: new[] { "@t" });
+
+        Assert.False(result.Eligible);
+        Assert.Equal("table-type-scalar-reference", result.Refusal!.ReasonCode);
+    }
+
+    [Fact]
+    public void Allows_ASubtreeThatMerelyReadsATableTypeVariable()
+    {
+        // `FROM @t` is a VariableTableReference — R1 rewrites it to the realization and nothing
+        // is materialized, so the chain never moves. Refusing here would kill boost for every
+        // loop that so much as reads a table variable, which is the common case.
+        var result = Plan(
+            "WHILE @i < 3\nBEGIN\n    SET @n = (SELECT COUNT(*) FROM @t);\n    SET @i = @i + 1;\nEND",
+            tableTypeVariables: new[] { "@t" });
+
+        Assert.True(result.Eligible, result.Refusal?.Detail);
     }
 }

@@ -24,6 +24,10 @@ you can step through real logic on a dev/test database without leaving anything 
 - **Call stack**, and a **Variables** panel: **Locals**, **Temp Tables** (browse `#temp` /
   `@table` contents), and **System** (`@@TRANCOUNT`, `XACT_STATE()`, `@@SPID`).
 - **Watch** and **hover**; **Set Value** to edit a local.
+- **User-defined types** — alias types (`CREATE TYPE dbo.Name FROM nvarchar(50)`) and table
+  types (`DECLARE @t dbo.OrderRows`) step like any other variable; a table-type variable
+  shows up under **Temp Tables**, and passing one as a table-valued parameter to a procedure
+  works (that call is stepped over, not into).
 - **Debug Console** (`Ctrl+Shift+Y`) — a live T-SQL REPL against the current frame, so
   `SELECT @x` and `SELECT * FROM #work` just work. Writable by default.
 - **Breakpoints** — conditional, hit-count, and **logpoints**; toggle **Caught / Unhandled**

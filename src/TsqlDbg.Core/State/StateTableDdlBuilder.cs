@@ -43,7 +43,7 @@ public static class StateTableDdlBuilder
 
         var table = StateTableIdentifiers.TableName(frameOrdinal);
         var sets = string.Join(", ", variables.Select(v =>
-            $"{StateTableIdentifiers.ColumnName(v.Declaration.Name)} = CONVERT({v.Declaration.DataTypeSql}, {parameterName(v)})"));
+            $"{StateTableIdentifiers.ColumnName(v.Declaration.Name)} = CONVERT({v.Declaration.StorageType}, {parameterName(v)})"));
         return $"UPDATE {table} SET {sets};";
     }
 
@@ -122,6 +122,10 @@ public static class StateTableDdlBuilder
 
     private static readonly IReadOnlyDictionary<string, string> EmptySeeds = new Dictionary<string, string>();
 
+    // A59: the STORAGE type, not the declared one — the state table lives in tempdb, which
+    // cannot see a user-defined alias type (fact 34a, msg 2715). For every other type the
+    // two are the same string. The COLUMN form carries the collation; the CONVERT sites use
+    // the bare form, which is the only one CONVERT accepts. (§8.1)
     private static string ColumnDefinition(VariableSlot v) =>
-        $"{StateTableIdentifiers.ColumnName(v.Declaration.Name)} {v.Declaration.DataTypeSql} NULL";
+        $"{StateTableIdentifiers.ColumnName(v.Declaration.Name)} {v.Declaration.StorageColumnType} NULL";
 }

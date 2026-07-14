@@ -59,6 +59,20 @@ public sealed class DuplicateVariableException : Exception
 }
 
 /// <summary>
+/// DESIGN §8.2 (A59): a declared type the debugger cannot store. Today that is exactly the
+/// CLR (assembly) user-defined type — it has no literal form for the state table or the
+/// re-seed. Named rather than left to the server, which would otherwise raise a bare 2715
+/// from deep inside frame init. Refuses the launch at frame 0; a callee push catches it and
+/// steps over instead.
+/// </summary>
+public sealed class UnsupportedVariableTypeException : Exception
+{
+    public UnsupportedVariableTypeException(string variableName, string dataTypeSql, string reason)
+        : base($"The variable {variableName} is declared as '{dataTypeSql}', which the debugger " +
+               $"cannot step through: {reason} (DESIGN §8.2).") { }
+}
+
+/// <summary>
 /// Ordered, case-insensitive registry of a frame's live variables (§8). Consumed by the
 /// state-table DDL generator (§8.1), the composed-batch preamble/postamble (§7.1), and
 /// the Locals scope (§12.1). Populated as the cursor performs DECLARE actions (§8.2).
@@ -82,6 +96,28 @@ public sealed class VariableCatalog
     }
 
     public bool TryGet(string name, out VariableSlot slot) => _byName.TryGetValue(name, out slot!);
+}
+
+/// <summary>
+/// DESIGN §8.2/§9 (A59): a <c>DECLARE @t dbo.MyTable</c> variable. Realized as a #temp like
+/// any table variable (R1), but it keeps its TYPE — because a #temp cannot be passed to a
+/// table-valued parameter and only a variable of the type can, so an <c>EXEC p @rows = @t</c>
+/// argument is served by re-declaring the real thing in the composed batch's preamble and
+/// filling it from the realization (§9). <see cref="InsertableColumns"/> excludes IDENTITY
+/// and computed columns: neither can be supplied to a table variable (fact 34e → C28).
+/// </summary>
+public sealed class TableTypeVariable
+{
+    public required string Name { get; init; }                    // with '@'
+    public required State.UserTypeEntry Type { get; init; }
+    public required string RealizationName { get; init; }         // #__dbgtv_{frame}_{name}
+    public IReadOnlyList<string> InsertableColumns { get; set; } = Array.Empty<string>();
+
+    /// <summary>The type's IDENTITY column, or null (§9/C28). Non-null means the §9 TVP
+    /// materialization both needs an ORDER BY (so identity values are re-generated in the
+    /// realization's own order) and MOVES the connection's identity chain (fact 34h) —
+    /// SCOPE_IDENTITY() included, which is R6-shadowed and therefore the session's problem.</summary>
+    public string? IdentityColumn { get; set; }
 }
 
 public enum TempObjectKind { TempTable, TableVariable, Cursor }
@@ -179,6 +215,18 @@ public sealed class Frame
     public string StateTableName { get; }                       // "#__dbg_s{n}" (§8.1)
     public VariableCatalog Variables { get; } = new();
     public TempObjectRegistry TempObjects { get; } = new();
+
+    /// <summary>
+    /// DESIGN §8.2/§9 (A59): the frame's <c>DECLARE @t dbo.MyTable</c> variables — table
+    /// variables in everything but syntax, so they are deliberately absent from
+    /// <see cref="Variables"/> (no state-table column, no preamble DECLARE) and present in
+    /// <see cref="TempObjects"/> as R1 realizations instead. Kept alongside because the
+    /// composed batch needs the type back: passing one as a TVP argument means declaring a
+    /// real variable of that type and filling it from the realization (§9).
+    /// Name (with '@') → the variable.
+    /// </summary>
+    public Dictionary<string, TableTypeVariable> TableTypeVariables { get; } =
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// M3 (§7.2/§10.4): the debuggee's runtime SET XACT_ABORT state, tracked from

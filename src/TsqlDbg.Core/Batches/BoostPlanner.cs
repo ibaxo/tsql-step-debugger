@@ -66,9 +66,12 @@ public static class BoostPlanner
     /// SUs (incl. conditional/hit-count — all require per-hit evaluation). The adapter
     /// passes its per-module store lookup; the fidelity harness passes _ => false.
     /// Core stays ignorant of DAP breakpoint storage (B1).</param>
+    /// <param name="tableTypeVariables">A59 (§9/§14): the frame's table-type variable names.
+    /// A subtree that passes one as a TVP argument is refused — see the scan below.</param>
     public static BoostPlanResult TryPlan(
         StatementUnit controlNode, StatementIndex index,
-        BoostSessionGate gate, Func<StatementUnit, bool> isBlocked)
+        BoostSessionGate gate, Func<StatementUnit, bool> isBlocked,
+        IReadOnlyCollection<string>? tableTypeVariables = null)
     {
         // ---- B2: plain-healthy session only. --------------------------------------
         if (gate.Broken) return BoostPlanResult.Refuse("session-broken", "the session is broken");
@@ -224,6 +227,27 @@ public static class BoostPlanner
             return BoostPlanResult.Refuse("next-value-for", "NEXT VALUE FOR inside the subtree — a durable side effect makes assignment-retry after attention unsound (B7)");
         }
 
+        // A59 (§9/§14): a table-type variable passed as a TVP argument — `SET @n = dbo.f(@t)`,
+        // `FROM dbo.tvf(@t)`, `IF dbo.f(@t) > 0`. Boosting it would need the §9 materialization
+        // INSERT in the batch preamble, and inserting into a table variable with an IDENTITY
+        // column MOVES the connection's identity chain (fact 34h) — which is precisely the
+        // chain boost's post-block SCOPE_IDENTITY() capture (fact 26d) depends on. Interpreted
+        // mode materializes it correctly and poisons the chain deliberately; boost cannot,
+        // because in-slice inserts and the preamble insert are indistinguishable afterwards.
+        // Conservative-closed, per A21: refusal costs only speed. (EXEC is not on the member
+        // whitelist, so this catches the function-call shapes, which are the reachable ones.)
+        if (tableTypeVariables is { Count: > 0 })
+        {
+            var tvpScan = new TableTypeScalarScanVisitor(tableTypeVariables);
+            controlNode.Fragment.Accept(tvpScan);
+            if (tvpScan.VariableName is { } tvp)
+            {
+                return BoostPlanResult.Refuse("table-type-scalar-reference",
+                    $"{tvp} (a table-type variable) is passed as a TVP argument inside the subtree — " +
+                    "the §9 materialization would move the identity chain the boost capture rides (§14/A59)");
+            }
+        }
+
         var markers = BoostSubtreeMarkers.Compute(controlNode.Fragment);
         return new BoostPlanResult(new BoostPlan(controlNode, markers, lineMap, members), null);
     }
@@ -267,5 +291,31 @@ public static class BoostPlanner
         }
 
         public override void Visit(NextValueForExpression node) => SawNextValueFor = true;
+    }
+
+    // A59: mirrors ComposedBatchBuilder.CollectTvpArguments exactly — including its one
+    // subtlety, that a VariableTableReference (`FROM @t`) CONTAINS a VariableReference for
+    // its own name. Descending into one would refuse every boosted loop that merely READS a
+    // table-type variable, which R1 rewrites to the realization and which boosts perfectly.
+    private sealed class TableTypeScalarScanVisitor : TSqlFragmentVisitor
+    {
+        private readonly HashSet<string> _names;
+
+        public TableTypeScalarScanVisitor(IReadOnlyCollection<string> names)
+            => _names = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+
+        public string? VariableName { get; private set; }
+
+        public override void ExplicitVisit(VariableTableReference node)
+        {
+        }
+
+        public override void Visit(VariableReference node)
+        {
+            if (node.Name is { Length: > 0 } name && _names.Contains(name))
+            {
+                VariableName ??= name;
+            }
+        }
     }
 }

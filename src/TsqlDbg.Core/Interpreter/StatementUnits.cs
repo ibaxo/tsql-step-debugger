@@ -160,6 +160,43 @@ public sealed record VariableDeclaration(
     string? InitializerSql,            // exact source slice of the initializer expression, or null
     DeclareVariableElement Fragment)
 {
+    /// <summary>
+    /// DESIGN §8.1 (A59): the type the debugger STORES the variable as, when that differs
+    /// from the type the user DECLARED it as. Set only for a user-defined alias type, whose
+    /// declared name is illegal both as a tempdb column (fact 34a, msg 2715) and as a
+    /// CONVERT target (fact 34b, msg 243) — it is resolved to the alias's BASE type, bare.
+    ///
+    /// Resolved at FRAME INIT, not at parse time: only the §4 step-2a catalog can tell an
+    /// alias type from a table type, and neither the parser nor ScriptDom can (fact 34).
+    /// </summary>
+    public string? StorageTypeSql { get; init; }
+
+    /// <summary>
+    /// DESIGN §8.1 (A59): the alias base type's collation, kept SEPARATE from
+    /// <see cref="StorageTypeSql"/> because the two places the storage type is emitted do not
+    /// accept the same string: a column definition takes <c>COLLATE</c>, and a
+    /// <c>CONVERT</c> target does NOT (`CONVERT(nvarchar(50) COLLATE …, @p)` is msg 156,
+    /// "Incorrect syntax near the keyword 'COLLATE'"). Null for non-character types.
+    /// </summary>
+    public string? StorageCollation { get; init; }
+
+    /// <summary>
+    /// The type to emit at every <c>CONVERT(&lt;type&gt;, @p)</c> site — the doomed seed, the REPL
+    /// doomed seed, the §10.4 resurrection re-seed, and §8.3's setVariable UPDATE — and for
+    /// §8.3's safe-literal-form test. Bare: no <c>COLLATE</c> (see <see cref="StorageCollation"/>).
+    /// The composed batch's preamble DECLARE keeps <see cref="DataTypeSql"/> instead — the
+    /// debuggee's own variable is the user's type, so execution stays native.
+    /// </summary>
+    public string StorageType => StorageTypeSql ?? DataTypeSql;
+
+    /// <summary>
+    /// The type to emit for the state table's COLUMN (§8.1) — the storage type plus its
+    /// collation, so a user database whose collation differs from tempdb's cannot transcode
+    /// a <c>varchar</c> value on the round trip.
+    /// </summary>
+    public string StorageColumnType =>
+        StorageCollation is null ? StorageType : $"{StorageType} COLLATE {StorageCollation}";
+
     /// <summary>Extracts all declarators of a DECLARE statement. DESIGN §7.2 / §8.2.</summary>
     public static IReadOnlyList<VariableDeclaration> Extract(DeclareVariableStatement declare, string fullScript)
     {
