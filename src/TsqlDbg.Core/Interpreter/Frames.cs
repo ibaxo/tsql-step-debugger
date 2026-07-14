@@ -9,8 +9,33 @@ namespace TsqlDbg.Core.Interpreter;
 /// <summary>Identity of the module a frame executes (§5.2/§11).</summary>
 public sealed record ModuleIdentity(string? Database, string? Schema, string Name, bool IsScript)
 {
+    /// <summary>A58 (§11.6): the reserved schema token that marks a dynamic-SQL frame, so a
+    /// dynamic identity round-trips through the existing 3-segment <c>tsqldbg:</c> virtual-doc
+    /// path (<c>{schema}.{name}.sql</c>) with no new DAP surface.</summary>
+    public const string DynamicSchema = "__dyn";
+
     public static ModuleIdentity Script(string name = "<script>") => new(null, null, name, true);
-    public string Display => IsScript ? Name : $"{Schema ?? "dbo"}.{Name}";
+
+    /// <summary>A58 (§11.6): a dynamic-SQL frame — text that exists only in the session, keyed
+    /// by a CONTENT hash so that re-executing the same string (a loop, a repeated call) re-binds
+    /// to the same virtual document and keeps the breakpoints the user set in it.</summary>
+    public static ModuleIdentity Dynamic(string? database, string contentHash)
+        => new(database, DynamicSchema, contentHash, IsScript: false) { IsDynamic = true };
+
+    /// <summary>A58: true for a dynamic-SQL frame. Distinct from <see cref="IsScript"/> (frame 0's
+    /// real .sql file) and from a catalog module: a dynamic batch has NO <c>sys.sql_modules</c> row,
+    /// so it takes its parse settings from its caller (fact 33a), and native <c>ERROR_PROCEDURE()</c>
+    /// reads NULL inside one (fact 33c) — §10.2 must not synthesize a module name for it.</summary>
+    public bool IsDynamic { get; init; }
+
+    /// <summary>A58 (fact 33e): engine nesting levels this frame costs. A dynamic batch runs at
+    /// <c>@@NESTLEVEL + 2</c> — <c>sp_executesql</c> is itself a module at level 1 — so the §11.3
+    /// step-3 synthetic-217 mirror must weight it 2, not 1.</summary>
+    public int NestCost => IsDynamic ? 2 : 1;
+
+    public string Display => IsScript
+        ? Name
+        : IsDynamic ? $"dynamic SQL #{Name}" : $"{Schema ?? "dbo"}.{Name}";
 }
 
 /// <summary>
@@ -221,6 +246,25 @@ public sealed class FrameStack
         : throw new InvalidOperationException("Frame stack is empty.");
     public int Depth => _frames.Count;
     public IReadOnlyList<Frame> All => _frames;                  // bottom (root) → top; DAP stackTrace reverses
+
+    /// <summary>A58 (§11.3 step 3 / fact 33e): the engine <c>@@NESTLEVEL</c> this virtual stack
+    /// models. A script batch is level 0, a procedure frame costs 1, and a dynamic-SQL frame costs
+    /// **2** (<c>sp_executesql</c> is itself a module, so its dynamic batch runs two levels down).
+    /// Feeds the synthetic-217 mirror only: the debugger FLATTENS, so the server never actually
+    /// nests — the limit exists solely to reproduce the engine's own refusal.</summary>
+    public int EngineNestLevel
+    {
+        get
+        {
+            var level = 0;
+            foreach (var frame in _frames)
+            {
+                level += frame.Module.IsScript ? 0 : frame.Module.NestCost;
+            }
+
+            return level;
+        }
+    }
 
     /// <summary>Reserves the next monotonic frame ordinal (§11.4).</summary>
     public int NextOrdinal() => _nextOrdinal++;

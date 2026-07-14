@@ -8,13 +8,24 @@ using Xunit;
 
 namespace TsqlDbg.Integration;
 
-// DESIGN §20.4 corpus fixture p22_error_context_dynsql + M7 D3 §3.3 (docs/archive/reviews/
-// m7-hardening-design-notes-fable.md): C21 through dynamic SQL -- NO exact pass
-// exists for this fixture. C10 (dynamic SQL is an atomic black box) makes step-into
-// refuse and fall back to step-over, so every pass re-materializes the active error
-// context (§10.7) around the EXEC(@s) -- exempt Num (C21) on all three passes; Msg
-// stays faithful everywhere. Also the corpus-level twin of
-// Fact7RematerializationLiveTests, proving the §10.7 shell reaches dynamic children.
+// DESIGN §20.4 corpus fixture p22_error_context_dynsql: C21 through dynamic SQL.
+//
+// A58 (§11.6) CHANGED THIS FIXTURE'S VERDICT, and the change is the point. Before A58, C10 made
+// step-into refuse dynamic SQL, so EVERY pass stepped over the EXEC(@s) and re-materialized the
+// active error context (§10.7) around it -- and because re-materialization raises a NEW error,
+// the dynamic child's ERROR_NUMBER() read RAISERROR's own 50000 instead of the real 8134. The
+// manifest's own words were "C10 means there is no exact pass for this fixture at all".
+//
+// C21's prescribed remedy has always been "step INTO the callee for exact per-statement values
+// (§10.7/R7)" -- it was simply unavailable for dynamic SQL. A58 makes it available: the Into pass
+// now PUSHES a dynamic frame, R7 substitution reaches the ERROR_*() references inside the dynamic
+// text, and the shadow serves the TRUE 8134. So this fixture now has an EXACT pass, exactly like
+// its procedure-callee twin p21 -- and the C21 exemption narrows to the over/boost passes, which
+// still step over and still re-materialize. That is a caveat retiring on a path, not a
+// regression: the debugger got strictly more faithful, so the assertion got strictly stronger.
+//
+// Still the corpus-level twin of Fact7RematerializationLiveTests on the over/boost passes,
+// proving the §10.7 shell reaches dynamic children.
 public sealed class P22ErrorContextDynsqlFidelityTests
 {
     private const string ConnEnvVar = "TSQLDBG_TEST_CONN";
@@ -28,7 +39,8 @@ public sealed class P22ErrorContextDynsqlFidelityTests
     private sealed record Exemption(
         [property: JsonPropertyName("field")] string Field,
         [property: JsonPropertyName("caveatId")] string CaveatId,
-        [property: JsonPropertyName("reason")] string Reason);
+        [property: JsonPropertyName("reason")] string Reason,
+        [property: JsonPropertyName("passes")] List<string>? Passes);
 
     [SkippableFact]
     public async Task DebuggerRun_MatchesNativeRun_ForErrorContextDynsql_ExceptC21ExemptedField()
@@ -52,16 +64,18 @@ public sealed class P22ErrorContextDynsqlFidelityTests
         AssertFaithfulAndExempted(native, debugged);
     }
 
-    // step-into refuses ALL dynamic SQL (C10) -- trajectory-identical to the Over pass.
+    // Into pass (A58, §11.6): EXACT, zero exemptions -- the same shape p21 has had all along for a
+    // procedure callee. The EXEC(@s) now pushes a DYNAMIC FRAME, so R7 substitution reaches the
+    // ERROR_*() references inside the dynamic text and reads the real error context rather than
+    // the §10.7 re-materialization wrapper's. This is the assertion that would have caught a
+    // regression back to step-over: it demands the TRUE 8134, which only a pushed frame produces.
     [SkippableFact]
-    public async Task DebuggerRun_MatchesNativeRun_SteppedInto()
+    public async Task DebuggerRun_MatchesNativeRun_SteppedInto_Exact()
     {
         var rawConnectionString = Environment.GetEnvironmentVariable(ConnEnvVar);
         Skip.If(
             string.IsNullOrWhiteSpace(rawConnectionString),
             $"{ConnEnvVar} is not set; skipping fidelity test (never fake a pass — CLAUDE.md).");
-
-        await AssertExemptionAsync();
 
         var csb = new SqlConnectionStringBuilder(rawConnectionString);
         var server = csb.DataSource;
@@ -72,7 +86,9 @@ public sealed class P22ErrorContextDynsqlFidelityTests
         var native = await RunNativeAsync(rawConnectionString!);
         var debugged = await RunThroughDebuggerAsync(server, database, StepKind.Into);
 
-        AssertFaithfulAndExempted(native, debugged);
+        Assert.Equal(native, debugged);                              // zero exemptions
+        Assert.Equal(8134, native.Num);                              // the REAL divide-by-zero, not RAISERROR's 50000
+        Assert.Equal("Divide by zero error encountered.", native.Msg);
     }
 
     // Pass 3 (§6.2 MANDATORY non-hollow declaration): no IF/WHILE anywhere in this
@@ -108,13 +124,16 @@ public sealed class P22ErrorContextDynsqlFidelityTests
         Assert.DoesNotContain(trace.Events, e => e.Category.StartsWith("boost."));
     }
 
+    // The OVER/BOOST passes only: they step over the EXEC(@s), so §10.7 re-materializes the error
+    // context around it and the dynamic child reads RAISERROR's 50000 (C21). The Into pass is
+    // exact and asserts equality instead — see DebuggerRun_MatchesNativeRun_SteppedInto_Exact.
     private static void AssertFaithfulAndExempted(DynsqlResult native, DynsqlResult debugged)
     {
         // Faithful half (§10.7's whole point -- the fact-7 fix): the message matches.
         Assert.Equal(native.Msg, debugged.Msg);
         Assert.Equal("Divide by zero error encountered.", native.Msg);
 
-        // Exempted (C21, ALL passes) -- known divergent values, asserted explicitly
+        // Exempted (C21, over/boost) -- known divergent values, asserted explicitly
         // rather than silently skipped (the p10/p24 non-hollow pattern).
         Assert.Equal(8134, native.Num);
         Assert.Equal(50000, debugged.Num);
@@ -126,6 +145,10 @@ public sealed class P22ErrorContextDynsqlFidelityTests
         var exemption = Assert.Single(manifest.Exemptions);
         Assert.Equal("Num", exemption.Field);
         Assert.Equal("C21", exemption.CaveatId);
+        // A58: the exemption is now pass-scoped — the Into pass is exact (§11.6), so it must NOT
+        // be exempt. Pinning the array here is what stops the exemption from silently widening
+        // back to "all passes" and re-hiding a step-over regression.
+        Assert.Equal(new[] { "over", "boost" }, exemption.Passes);
     }
 
     private static async Task<Manifest> LoadManifestAsync()

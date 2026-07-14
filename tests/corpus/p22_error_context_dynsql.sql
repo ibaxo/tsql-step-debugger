@@ -1,10 +1,18 @@
--- DESIGN.md §20.4 corpus fixture: p22_error_context_dynsql
--- M7 D3 §3.3 (docs/archive/reviews/m7-hardening-design-notes-fable.md): C21 through dynamic
--- SQL -- NO exact pass exists for this fixture. C10 (dynamic SQL is an atomic black
--- box) makes step-into refuse and fall back to step-over, so EVERY pass re-materializes
--- the active error context (§10.7) around the EXEC(@s) -- exempt num (C21) on all three
--- passes; msg stays faithful everywhere (the corpus-level twin of
--- Fact7RematerializationLiveTests, proving the §10.7 shell reaches dynamic children).
+-- DESIGN.md §20.4 corpus fixture: p22_error_context_dynsql -- C21 through dynamic SQL.
+--
+-- A58 (§11.6) gave this fixture an EXACT pass, which it did not have before. Previously C10
+-- made step-into refuse dynamic SQL, so every pass stepped over the EXEC(@s) and
+-- re-materialized the active error context (§10.7) around it; re-materialization raises a NEW
+-- error, so the dynamic child's ERROR_NUMBER() read RAISERROR's 50000 rather than the real
+-- 8134, and num was exempt (C21) on all three passes.
+--
+-- Now the INTO pass pushes a dynamic frame: R7 substitution reaches the ERROR_*() references
+-- inside the dynamic text and the shadow serves the true 8134 -- exactly C21's own prescribed
+-- remedy ("step into the callee for exact per-statement values"), which was unavailable for
+-- dynamic SQL until A58. So Into is exact and zero-exemption (like p21, its procedure-callee
+-- twin); over/boost still step over, still re-materialize, and keep the C21 exemption -- and
+-- remain the corpus-level twin of Fact7RematerializationLiveTests, proving the §10.7 shell
+-- reaches dynamic children.
 IF OBJECT_ID('dbo.p22_log') IS NULL
 CREATE TABLE dbo.p22_log (id int IDENTITY(1,1) PRIMARY KEY, msg nvarchar(4000), num int);
 GO

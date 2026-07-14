@@ -85,6 +85,14 @@ public sealed class Session
     private readonly RuntimeOptionTracker _runtimeOptions = new();          // D6: §11.2 pop restores
     private readonly Dictionary<string, ModuleBlueprint> _moduleCache =
         new(StringComparer.OrdinalIgnoreCase);                              // §11.4/§15: definition fetch cache
+
+    // A58 (§11.6): every dynamic-SQL frame this session has pushed, keyed by the content hash in
+    // its ModuleIdentity. Unlike a module, a dynamic frame's text exists NOWHERE else — not on
+    // disk, not in the catalog — so it must be retained here or its read-only virtual document
+    // goes blank the moment the frame pops (VS Code keeps the editor open). Never invalidated: the
+    // key IS the content, so an entry can never go stale.
+    private readonly Dictionary<string, StatementIndex> _dynamicIndexes =
+        new(StringComparer.Ordinal);
     private bool _untrackedOptionNoted;                                     // D6 residual, console-noted once
     private bool? _cursorDefaultIsGlobal;                                   // R3: db CURSOR_DEFAULT, checked lazily
     private int _spid;                                                      // M5 I3: captured once at connection open
@@ -274,6 +282,15 @@ public sealed class Session
         if (identity.IsScript)
         {
             return (null, "The script frame is not part of this session.");
+        }
+
+        // A58 (§11.6): a dynamic frame's text has no catalog definition to re-fetch — it is served
+        // from the session's retention map, so the virtual document survives the frame's pop.
+        if (identity.IsDynamic)
+        {
+            return _dynamicIndexes.TryGetValue(identity.Name, out var dynamicIndex)
+                ? (dynamicIndex, null)
+                : (null, "That dynamic SQL was not executed in this session.");
         }
 
         if (_broken)
@@ -2893,8 +2910,13 @@ public sealed class Session
     // read NULL. The verbatim rule for server-named modules (a stepped-OVER nested proc)
     // is unchanged (builtProcedure is non-null there); C21 (indirect re-materialized
     // consumers read wrapper values) is unaffected — it never reaches a NULL procedure.
+    // A58 (§11.6, fact 33c): a DYNAMIC frame is not a catalog module — native
+    // ERROR_PROCEDURE() reads NULL inside an sp_executesql/EXEC() batch, whether the fault
+    // is caught inside it or by the caller. So it joins script frames on the NULL side of
+    // this synthesis; only a real module (procedure-mode frame 0, a stepped-into proc) is
+    // named. Getting this wrong would make the debugger name a module the engine does not.
     private static string? SynthesizeProcedure(string? builtProcedure, Interpreter.ModuleIdentity originModule)
-        => builtProcedure ?? (originModule.IsScript ? null : originModule.Display);
+        => builtProcedure ?? (originModule.IsScript || originModule.IsDynamic ? null : originModule.Display);
 
     // The shape the native client prints for an error it received (fact 18's
     // continuation surface) — RunToEnd/fidelity and the Debug Console both show this.
@@ -3839,9 +3861,24 @@ public sealed class Session
         ReconcileErrorContexts();
     }
 
+    // A58 (§11.6): everything a callee frame needs, however it was sourced — a catalog module
+    // (OBJECT_DEFINITION + sys.sql_modules) or a dynamic-SQL string evaluated at the call site.
+    // From actual-to-formal matching onward the two take exactly the same code path
+    // (PushCalleeFrameAsync), which is the whole point of A58: a dynamic frame is an ordinary
+    // §11 frame whose text happened to be computed a moment ago rather than read from the catalog.
+    private sealed record CalleePlan(
+        string DisplayName,                                  // how console notes name this callee
+        string Text,                                         // the frame's FullScript (§5.3 slice source)
+        ModuleIdentity Identity,
+        SetOptionEnvironment SetEnv,
+        FrameKind FrameKind,
+        IList<TSqlStatement> Body,
+        IReadOnlyList<CalleeParameter> Formals,
+        IList<ExecuteParameter> Actuals);
+
     // §11.1/§11.3 step-into. Returns null to fall back to step-over — for callee
-    // shapes the debugger can't push (C8 encrypted/unreadable, C9 TVP, C10 dynamic
-    // SQL), for erroneous calls (arg-shape mismatches: executing the EXEC natively
+    // shapes the debugger can't push (C8 encrypted/unreadable, C9 TVP, §11.6's ineligible
+    // dynamic shapes), for erroneous calls (arg-shape mismatches: executing the EXEC natively
     // surfaces the engine's own error through the §10.3 pipeline, which is more
     // faithful than any synthetic), and while doomed (state tables can't be created
     // under 3930). Non-null = the disposition: SteppedIn, or the routed/terminal
@@ -3861,9 +3898,36 @@ public sealed class Session
 
         var execute = (ExecuteStatement)unit.Fragment;
         var specification = execute.ExecuteSpecification;
+
+        // §11.6: shapes with no local frame to push. A linked-server EXEC runs remotely; an
+        // EXECUTE AS clause switches the callee's security principal (C4 territory) — neither is
+        // modelled, so both step over and execute natively.
+        if (specification.LinkedServer is not null || specification.ExecuteContext is not null)
+        {
+            messages.Add("EXEC AT <linked server> / WITH EXECUTE AS is step-over — stepping over (§11.6).");
+            return null;
+        }
+
+        // A58 (§11.6): EXEC(@str). ScriptDom models the `+`-concatenated operand list as
+        // ExecutableStringList.Strings (verified: IList<ValueExpression>), so the dynamic text is
+        // the concatenation of the evaluated elements. Unlike sp_executesql, EXEC() accepts
+        // varchar as well as nvarchar, so no provably-nvarchar gate applies here.
+        if (specification.ExecutableEntity is ExecutableStringList stringList)
+        {
+            if (DepthLimitReached(frames, ModuleIdentity.Dynamic(null, "x").NestCost))
+            {
+                return await RouteNestingLimitAsync(unit, messages).ConfigureAwait(false);
+            }
+
+            return await StepIntoDynamicAsync(
+                caller, unit, specification, stringList.Strings, requireNVarchar: false,
+                paramsExpression: null, actuals: new List<ExecuteParameter>(), displayName: "EXEC(…)",
+                messages, cancellationToken).ConfigureAwait(false);
+        }
+
         if (specification.ExecutableEntity is not ExecutableProcedureReference procedureEntity)
         {
-            messages.Add("Dynamic SQL (EXEC(@s) / sp_executesql) is step-over in this milestone — stepping over (C10, §11.6).");
+            messages.Add("This EXEC shape is step-over — stepping over (§11.6).");
             return null;
         }
 
@@ -3874,20 +3938,31 @@ public sealed class Session
             return null;
         }
 
-        if (frames.Depth >= FrameStack.MaxDepth)
-        {
-            // §11.3 step 3: the debugger's virtual frames must mirror the engine's
-            // 32-level limit — a stepped-over EXEC here would run at server nesting 1
-            // and NOT reproduce it, so the 217 is synthesized through §10.3.
-            var values = new ErrorContextValues(217, 16, 2, unit.Span.StartLine, null,
-                $"Maximum stored procedure, function, trigger, or view nesting level exceeded (limit {FrameStack.MaxDepth}).");
-            return await PerformRouteAsync(values, unit, xactState: 1,
-                terminalWhenUnhandled: false, messages).ConfigureAwait(false);
-        }
-
         var nameText = caller.Cursor.Index.FullScript.Substring(
             procedureName.StartOffset, procedureName.FragmentLength);
+
+        // §11.3 step 3: the debugger's virtual frames must mirror the engine's 32-level limit —
+        // a stepped-over EXEC here would run at server nesting 1 and NOT reproduce it, so the 217
+        // is synthesized through §10.3. A58: the cost is read from the call SHAPE (a dynamic frame
+        // costs 2 levels, fact 33e), because the plan — and its identity — isn't built yet.
+        if (DepthLimitReached(frames, IsSpExecuteSqlName(nameText) ? 2 : 1))
+        {
+            return await RouteNestingLimitAsync(unit, messages).ConfigureAwait(false);
+        }
+
         var blueprint = await FetchModuleBlueprintAsync(nameText, cancellationToken).ConfigureAwait(false);
+
+        // A58 (§11.6): sp_executesql is a NATIVE module — it has no sys.sql_modules row, which is
+        // why it used to land in the C8 "no readable definition" refusal, a mislabel. Recognise it
+        // only once the catalog fetch has come back empty, so that a user procedure legitimately
+        // shadowing the name (an `sp_`-prefixed name resolves in the current database first) is
+        // still stepped into as itself — which is what the engine would execute.
+        if (blueprint is null && IsSpExecuteSqlName(nameText))
+        {
+            return await StepIntoSpExecuteSqlAsync(
+                caller, unit, specification, procedureEntity, messages, cancellationToken).ConfigureAwait(false);
+        }
+
         if (blueprint is null)
         {
             messages.Add($"Cannot step into '{nameText}': no readable definition (missing, encrypted, natively " +
@@ -3910,10 +3985,349 @@ public sealed class Session
             return null;
         }
 
-        var calleeParameters = ExtractCalleeParameters(parsed, blueprint.Definition);
+        var plan = new CalleePlan(
+            nameText,
+            blueprint.Definition,
+            new ModuleIdentity(_options.Database, blueprint.Schema, blueprint.Name, IsScript: false),
+            new SetOptionEnvironment(blueprint.QuotedIdentifier, blueprint.AnsiNulls),
+            FrameKind.Procedure,
+            FrameBodyResolver.ResolveProcedureBody(parsed),
+            ExtractCalleeParameters(parsed, blueprint.Definition),
+            procedureEntity.Parameters);
+
+        return await PushCalleeFrameAsync(plan, caller, unit, specification, messages, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    // §11.3 step 3 (A58): the virtual stack's engine-nesting mirror. The frame-count bound is the
+    // incumbent check (unchanged for procedure callees); the weighted bound is what makes a
+    // dynamic frame's 2-level cost (fact 33e) count. Either tripping = the engine's 217.
+    private static bool DepthLimitReached(FrameStack frames, int nestCost)
+        => frames.Depth >= FrameStack.MaxDepth
+           || frames.EngineNestLevel + nestCost > FrameStack.MaxDepth;
+
+    private Task<StepOutcome?> RouteNestingLimitAsync(Interpreter.StatementUnit unit, List<string> messages)
+    {
+        var values = new ErrorContextValues(217, 16, 2, unit.Span.StartLine, null,
+            $"Maximum stored procedure, function, trigger, or view nesting level exceeded (limit {FrameStack.MaxDepth}).");
+        return PerformRouteAsync(values, unit, xactState: 1, terminalWhenUnhandled: false, messages)!;
+    }
+
+    // A58 (§11.6): `sp_executesql`, in any of the forms the engine resolves — bare, [bracketed],
+    // sys.-qualified, master.sys.-qualified (all verified live). A one- or two-part name whose
+    // qualifier is anything else is somebody else's procedure, not the native one.
+    private static bool IsSpExecuteSqlName(string nameText)
+    {
+        var parts = nameText.Split('.');
+        for (var i = 0; i < parts.Length; i++)
+        {
+            parts[i] = parts[i].Trim().Trim('[', ']', '"');
+        }
+
+        if (parts.Length == 0 || !string.Equals(parts[^1], "sp_executesql", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return parts.Length switch
+        {
+            1 => true,
+            2 => IsAnyOf(parts[0], "sys", "dbo"),
+            3 => IsAnyOf(parts[0], "master") && IsAnyOf(parts[1], "sys", "dbo"),
+            _ => false,
+        };
+
+        static bool IsAnyOf(string value, params string[] candidates)
+            => candidates.Any(c => string.Equals(value, c, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // A58 (§11.6): sp_executesql's own formals are @statement and @parameters — the engine also
+    // accepts the prefix abbreviations @stmt / @params (verified live). A named actual binds to one
+    // of them only if that slot is still empty and no user argument has been seen yet, so a USER
+    // parameter that happens to be called @params still binds as a user parameter, as it does
+    // natively. Everything after the two is a user argument, positional or named.
+    private async Task<StepOutcome?> StepIntoSpExecuteSqlAsync(
+        Frame caller, Interpreter.StatementUnit unit, ExecuteSpecification specification,
+        ExecutableProcedureReference procedureEntity, List<string> messages,
+        CancellationToken cancellationToken)
+    {
+        ExecuteParameter? statementArg = null;
+        ExecuteParameter? paramsArg = null;
+        var userArgs = new List<ExecuteParameter>();
+
+        foreach (var actual in procedureEntity.Parameters)
+        {
+            if (actual.Variable?.Name is { } named)
+            {
+                if (statementArg is null && userArgs.Count == 0 && IsPrefixOf(named, "@statement"))
+                {
+                    statementArg = actual;
+                }
+                else if (paramsArg is null && userArgs.Count == 0 && IsPrefixOf(named, "@parameters"))
+                {
+                    paramsArg = actual;
+                }
+                else
+                {
+                    userArgs.Add(actual);
+                }
+            }
+            else if (statementArg is null)
+            {
+                statementArg = actual;
+            }
+            else if (paramsArg is null)
+            {
+                paramsArg = actual;
+            }
+            else
+            {
+                userArgs.Add(actual);
+            }
+        }
+
+        if (statementArg?.ParameterValue is not ScalarExpression statementExpression)
+        {
+            return null;                                     // engine 201: @statement not supplied
+        }
+
+        return await StepIntoDynamicAsync(
+            caller, unit, specification, new[] { statementExpression }, requireNVarchar: true,
+            paramsArg?.ParameterValue, userArgs, "sp_executesql", messages, cancellationToken)
+            .ConfigureAwait(false);
+
+        static bool IsPrefixOf(string candidate, string formal)
+            => candidate.Length > 1 && formal.StartsWith(candidate, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // A58 (§11.6): build and push a DYNAMIC frame. The statement text and the parameter definition
+    // are ordinary argument expressions — they evaluate at the call site through the §11.3 step-1
+    // scalar-eval pipeline, so `N'SELECT * FROM ' + @tbl` is supported and a fault in them routes
+    // through §10.3 with the EXEC SU as the location. The evaluated string becomes the frame's
+    // FullScript, parsed with the CALLER's QUOTED_IDENTIFIER/ANSI_NULLS (fact 33a: a dynamic batch
+    // inherits the session's; there is no sys.sql_modules row to read).
+    private async Task<StepOutcome?> StepIntoDynamicAsync(
+        Frame caller, Interpreter.StatementUnit unit, ExecuteSpecification specification,
+        IEnumerable<ScalarExpression> statementParts, bool requireNVarchar,
+        ScalarExpression? paramsExpression, IList<ExecuteParameter> actuals, string displayName,
+        List<string> messages, CancellationToken cancellationToken)
+    {
+        // The provably-nvarchar gate (sp_executesql only): a varchar @statement is engine msg 214.
+        // Stepping into it would let the DEBUGGER succeed where production fails — the debugger
+        // would be hiding the bug — so refuse and let the engine raise its own 214.
+        var text = new StringBuilder();
+        foreach (var part in statementParts)
+        {
+            if (requireNVarchar && !IsProvablyNVarchar(part, caller))
+            {
+                messages.Add("Cannot step into sp_executesql: its statement argument is not provably nvarchar " +
+                             "(the engine requires ntext/nchar/nvarchar) — stepping over (§11.6).");
+                return null;
+            }
+
+            var (value, outcome) = await EvaluateStringArgumentAsync(caller, part, unit, messages, cancellationToken)
+                .ConfigureAwait(false);
+            if (outcome is not null)
+            {
+                return outcome;                              // the expression itself faulted (§10.3)
+            }
+
+            text.Append(value);
+        }
+
+        var dynamicText = text.ToString();
+        if (string.IsNullOrWhiteSpace(dynamicText))
+        {
+            messages.Add($"Cannot step into {displayName}: the dynamic statement is empty — stepping over (§11.6).");
+            return null;
+        }
+
+        IReadOnlyList<CalleeParameter> formals = Array.Empty<CalleeParameter>();
+        if (paramsExpression is not null)
+        {
+            if (requireNVarchar && !IsProvablyNVarchar(paramsExpression, caller))
+            {
+                messages.Add("Cannot step into sp_executesql: its parameter-definition argument is not provably " +
+                             "nvarchar (the engine requires ntext/nchar/nvarchar) — stepping over (§11.6).");
+                return null;
+            }
+
+            var (paramsText, paramsOutcome) = await EvaluateStringArgumentAsync(
+                caller, paramsExpression, unit, messages, cancellationToken).ConfigureAwait(false);
+            if (paramsOutcome is not null)
+            {
+                return paramsOutcome;
+            }
+
+            if (!TryParseDynamicFormals(paramsText, out formals, out var formalsProblem))
+            {
+                messages.Add($"Cannot step into sp_executesql: {formalsProblem} — stepping over (§11.6).");
+                return null;
+            }
+        }
+
+        // Parse with the caller's parse settings (fact 33a). A parse failure, or a `GO` (natively
+        // msg 102 — not a T-SQL statement, though ScriptDom would happily split it into batches),
+        // is the A47 server-as-oracle case: step over and let the engine report it.
+        var parsed = ScriptParser.Parse(dynamicText, caller.SetEnv.QuotedIdentifier, _compatLevel, out var parseErrors);
+        if (parseErrors.Count > 0)
+        {
+            messages.Add($"Cannot step into {displayName}: the dynamic statement did not parse — stepping over, " +
+                         "so the server reports its own error (§11.6).");
+            return null;
+        }
+
+        IReadOnlyList<IList<TSqlStatement>> batches;
+        try
+        {
+            batches = FrameBodyResolver.ResolveScriptBatches(parsed);
+        }
+        catch (NotSupportedException)
+        {
+            messages.Add($"Cannot step into {displayName}: the dynamic statement has no executable statements — stepping over.");
+            return null;
+        }
+
+        if (batches.Count != 1)
+        {
+            messages.Add($"Cannot step into {displayName}: the dynamic statement contains a GO batch separator, " +
+                         "which is a syntax error inside dynamic SQL — stepping over (§11.6).");
+            return null;
+        }
+
+        var plan = new CalleePlan(
+            displayName,
+            dynamicText,
+            ModuleIdentity.Dynamic(_options.Database, DynamicTextHash(dynamicText)),
+            // A dynamic batch inherits the session's parse options (fact 33a), which for the
+            // debugger means the caller frame's tracked SetEnv.
+            new SetOptionEnvironment(caller.SetEnv.QuotedIdentifier, caller.SetEnv.AnsiNulls),
+            // FrameKind.Script: `RETURN <value>` is illegal inside a dynamic batch (fact 33d, msg
+            // 178) and FrameKind already encodes exactly that (fact 13). A body carrying one trips
+            // the parse-time diagnostic in the shared push → step-over → the engine raises its 178.
+            FrameKind.Script,
+            batches[0],
+            formals,
+            actuals);
+
+        return await PushCalleeFrameAsync(plan, caller, unit, specification, messages, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    // A58 (§11.6): is this argument provably nvarchar — i.e. would the engine accept it as
+    // sp_executesql's @statement (msg 214 otherwise)?
+    //
+    // Only two shapes can ever reach here, and that is a T-SQL grammar rule, not an assumption:
+    // an EXECUTE argument must be a **constant or a variable** — an expression is a syntax error
+    // ("Incorrect syntax near '+'", verified live), so `EXEC sp_executesql N'…' + @tbl` never
+    // runs natively at all. Anything else therefore falls through to `false` → step-over → the
+    // engine raises its own syntax error. That fall-through is load-bearing, not laziness: were
+    // this to accept a concatenation ScriptDom happened to parse, the debugger would cheerfully
+    // execute a statement the server rejects. (Concatenation IS legal in `EXEC(@a + @b)` — the
+    // engine's own `+ ...n` grammar — and arrives there as ExecutableStringList.Strings, which
+    // §11.6 concatenates; EXEC() accepts varchar too, so this gate does not apply to it.)
+    private static bool IsProvablyNVarchar(ScalarExpression expression, Frame frame) => expression switch
+    {
+        StringLiteral literal => literal.IsNational,
+        VariableReference variable => frame.Variables.TryGet(variable.Name, out var slot)
+                                      && IsNationalTypeSql(slot.Declaration.DataTypeSql),
+        _ => false,
+    };
+
+    // sysname IS nvarchar(128) — a very common way to hold a dynamic object name.
+    private static bool IsNationalTypeSql(string typeSql)
+    {
+        var name = typeSql.TrimStart().TrimStart('[', '"');
+        return name.StartsWith("nvarchar", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith("nchar", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith("ntext", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith("sysname", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // A58 (§11.6): evaluate one string-valued argument expression at the call site, through the
+    // same rewritten/error-wrapped scalar-eval pipeline §11.3 step 1 uses for ordinary arguments.
+    // A NULL evaluates to the empty string — natively sp_executesql treats a NULL statement as a
+    // no-op, and the caller's empty-text guard turns that into a step-over.
+    private async Task<(string Value, StepOutcome? Outcome)> EvaluateStringArgumentAsync(
+        Frame caller, ScalarExpression expression, Interpreter.StatementUnit unit,
+        List<string> messages, CancellationToken cancellationToken)
+    {
+        var batch = ComposedBatchBuilder.BuildForScalarEval(
+            caller, _rewriteEngine!, _rewriteContext!, expression,
+            caller.Cursor.Index.FullScript, _shadows!, DebuggeeComposition(caller));
+        var run = await RunFaultableBatchAsync(batch, unit, cancellationToken).ConfigureAwait(false);
+        if (run.Outcome is not null)
+        {
+            messages.AddRange(run.Messages);
+            return (string.Empty, run.Outcome);
+        }
+
+        var value = ExtractScalarObject(run.UserSets, batch);
+        return (value as string ?? string.Empty, null);
+    }
+
+    // A58 (§11.6): parse sp_executesql's @parameters string (`N'@a int, @b varchar(10) OUTPUT'`)
+    // into formals by wrapping it in a synthetic CREATE PROCEDURE shell and reading
+    // ProcedureStatementBodyBase.Parameters — the exact shape ExtractCalleeParameters already
+    // consumes, so §11.3's matching/seeding/OUTPUT machinery is reused verbatim. This is a
+    // PARSE-only use of a generated string: §5.3's "never regenerate statements" rule governs
+    // statements sent for EXECUTION, and the shell is never executed. The type/default source
+    // slices are taken from the shell text, which is why it is passed as the fullScript.
+    private bool TryParseDynamicFormals(
+        string parametersText, out IReadOnlyList<CalleeParameter> formals, out string problem)
+    {
+        formals = Array.Empty<CalleeParameter>();
+        problem = string.Empty;
+        if (string.IsNullOrWhiteSpace(parametersText))
+        {
+            return true;                                     // no parameter definition = no formals
+        }
+
+        const string prefix = "CREATE PROCEDURE __dbg_dynamic_params (";
+        const string suffix = ") AS BEGIN SET NOCOUNT ON; END";
+        var shell = prefix + parametersText + suffix;
+
+        var parsed = ScriptParser.Parse(shell, initialQuotedIdentifiers: true, _compatLevel, out var errors);
+        if (errors.Count > 0)
+        {
+            problem = "its parameter definition did not parse";
+            return false;
+        }
+
+        try
+        {
+            formals = ExtractCalleeParameters(parsed, shell);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or InvalidCastException)
+        {
+            problem = "its parameter definition is not a plain parameter list";
+            return false;
+        }
+
+        return true;
+    }
+
+    // A58 (§11.6): a dynamic frame's identity is a CONTENT hash of its text, so re-executing the
+    // same string — a loop, a repeated call — re-binds to the same virtual document and keeps the
+    // breakpoints the user set in it.
+    private static string DynamicTextHash(string text)
+    {
+        var bytes = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(text));
+        return Convert.ToHexString(bytes, 0, 8).ToLowerInvariant();
+    }
+
+    // §11.3 push, shared by procedure and dynamic (§11.6) callees: match the actuals to the
+    // formals, evaluate the argument expressions left-to-right, build the frame, create and seed
+    // its state table, and push. Returns null to fall back to step-over.
+    private async Task<StepOutcome?> PushCalleeFrameAsync(
+        CalleePlan plan, Frame caller, Interpreter.StatementUnit unit, ExecuteSpecification specification,
+        List<string> messages, CancellationToken cancellationToken)
+    {
+        var frames = _frames!;
+        var calleeParameters = plan.Formals;
         if (calleeParameters.Any(p => p.IsReadOnly))
         {
-            messages.Add($"Cannot step into '{nameText}': it takes a table-valued parameter — stepping over (C9, §11.3).");
+            messages.Add($"Cannot step into '{plan.DisplayName}': it takes a table-valued parameter — stepping over (C9, §11.3).");
             return null;
         }
 
@@ -3925,9 +4339,9 @@ public sealed class Session
         // ---- through the oracle exactly as the engine raises it.
         var actualByFormal = new Dictionary<string, ExecuteParameter>(StringComparer.OrdinalIgnoreCase);
         var sawNamed = false;
-        for (var position = 0; position < procedureEntity.Parameters.Count; position++)
+        for (var position = 0; position < plan.Actuals.Count; position++)
         {
-            var actual = procedureEntity.Parameters[position];
+            var actual = plan.Actuals[position];
             if (actual.Variable is { } formalName)
             {
                 sawNamed = true;
@@ -4006,25 +4420,26 @@ public sealed class Session
         }
 
         // ---- build the callee frame.
-        var (schema, name) = (blueprint.Schema, blueprint.Name);
         ExecutionCursor calleeCursor;
         var calleeDeclarations = calleeParameters.Select(p => p.Declaration).ToList();
         try
         {
             calleeCursor = ExecutionCursor.Create(
-                FrameBodyResolver.ResolveProcedureBody(parsed), blueprint.Definition,
-                FrameKind.Procedure, calleeDeclarations.Select(d => d.Name));
+                plan.Body, plan.Text, plan.FrameKind, calleeDeclarations.Select(d => d.Name));
         }
         catch (Exception ex) when (ex is MilestoneNotSupportedException or ParseTimeDiagnosticException)
         {
-            messages.Add($"Cannot step into '{nameText}': {ex.Message} — stepping over.");
+            // A58: this is also where a dynamic body carrying `RETURN <value>` lands — illegal
+            // inside a dynamic batch (fact 33d) and caught by FrameKind.Script's control-flow
+            // validation. Stepping over lets the engine raise its own msg 178.
+            messages.Add($"Cannot step into '{plan.DisplayName}': {ex.Message} — stepping over.");
             return null;
         }
 
         var cursorSupport = await CheckCursorDefaultAsync(calleeCursor.Index, cancellationToken).ConfigureAwait(false);
         if (cursorSupport is not null)
         {
-            messages.Add($"Cannot step into '{nameText}': {cursorSupport} — stepping over.");
+            messages.Add($"Cannot step into '{plan.DisplayName}': {cursorSupport} — stepping over.");
             return null;
         }
 
@@ -4041,9 +4456,9 @@ public sealed class Session
         _shadows!.RestoreScopeIdentity(null);
         var callee = new Frame(
             frames.NextOrdinal(),
-            new ModuleIdentity(_options.Database, schema, name, IsScript: false),
+            plan.Identity,
             calleeCursor,
-            new SetOptionEnvironment(blueprint.QuotedIdentifier, blueprint.AnsiNulls),
+            plan.SetEnv,
             callSite)
         {
             // Runtime options are connection-scoped: the callee enters with the
@@ -4057,8 +4472,17 @@ public sealed class Session
         }
         catch (DuplicateVariableException ex)
         {
-            messages.Add($"Cannot step into '{nameText}': {ex.Message} — stepping over.");
+            messages.Add($"Cannot step into '{plan.DisplayName}': {ex.Message} — stepping over.");
             return null;
+        }
+
+        // A58 (§11.6): retain the dynamic text's index for the life of the session, so its
+        // read-only virtual document stays readable after the frame pops (VS Code keeps the editor
+        // open, and breakpoints in it must still resolve). Content-keyed, so a repeat execution of
+        // the same string reuses the same entry rather than accumulating duplicates.
+        if (plan.Identity.IsDynamic)
+        {
+            _dynamicIndexes[plan.Identity.Name] = calleeCursor.Index;
         }
 
         // ---- server-side push (§11.3 step 2): state table + seed + evaluated args.

@@ -1,11 +1,12 @@
 {
   "fixture": "p22_error_context_dynsql",
-  "$comment": "DESIGN.md §20.3.1 point 6: a manifest may exclude a column/field from comparison for a specific pass only by citing a §21 caveat id. C10 makes every pass step over the dynamic EXEC(@s), so all three passes re-materialize (§10.7) and exempt this field identically -- no 'passes' filter needed (applies everywhere, the p10/p24 convention).",
+  "$comment": "DESIGN.md §20.3.1 point 6: a manifest may exclude a column/field from comparison for a specific pass only by citing a §21 caveat id. A58 (§11.6) NARROWED this exemption. It used to apply to all three passes, because C10 made step-into refuse dynamic SQL, so every pass stepped over the EXEC(@s) and re-materialized (§10.7). The Into pass now PUSHES a dynamic frame and is EXACT -- the same shape as p21, this fixture's procedure-callee twin -- so the exemption is scoped to over/boost via the optional 'passes' array (the p15_ext/p21 convention).",
   "exemptions": [
     {
       "field": "Num",
       "caveatId": "C21",
-      "reason": "The dynamic child batch is an indirect ERROR_*() consumer reached from an active error context (§10.7); its ERROR_NUMBER() reads RAISERROR's own 50000 on every pass (C10 means there is no exact pass for this fixture at all). Expected: native=8134 (fact 7: dynamic SQL invoked from a CATCH block sees the real error), debugger=50000 on Over/Into/boost alike."
+      "reason": "On the OVER and BOOST passes the dynamic child batch is an indirect ERROR_*() consumer reached from an active error context, so §10.7 re-materializes that context around the stepped-over EXEC(@s) -- and re-materialization raises a NEW error, so ERROR_NUMBER() inside the child reads RAISERROR's own 50000. Expected: native=8134 (fact 7: dynamic SQL invoked from a CATCH block sees the real error), debugger(over/boost)=50000. The INTO pass is NOT exempt: A58 pushes a dynamic frame, R7 substitution reaches the ERROR_*() references inside the dynamic text, and the shadow serves the true 8134 -- which is exactly C21's own prescribed remedy ('step into the callee for exact per-statement values'), unavailable for dynamic SQL until A58. See DESIGN.md §21 rows C21 and C10.",
+      "passes": ["over", "boost"]
     }
   ]
 }

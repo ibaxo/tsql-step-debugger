@@ -559,7 +559,7 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
                 return (null, $"'{schema}.{name}' belongs to a different session ({server}/{database}).", null);
             }
 
-            return (new Core.Interpreter.ModuleIdentity(database, schema, name, IsScript: false), null, null);
+            return (ModuleIdentityFromVirtualDoc(database, schema, name), null, null);
         }
 
         if (!string.IsNullOrEmpty(path) && _liveSession.Session.TryResolveModuleBySourceFile(path, out var matchedModule))
@@ -617,6 +617,16 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         return true;
     }
 
+    // A58 (§11.6): the reserved `__dyn` schema token marks a dynamic-SQL document. The identity
+    // must be reconstructed WITH its IsDynamic flag — ModuleIdentity equality includes it, and both
+    // the live-frame lookup and the session's dynamic-text retention map key on it. A plain
+    // 4-arg construction here would silently miss both and serve an empty document.
+    private static Core.Interpreter.ModuleIdentity ModuleIdentityFromVirtualDoc(
+        string database, string schema, string name)
+        => string.Equals(schema, Core.Interpreter.ModuleIdentity.DynamicSchema, StringComparison.Ordinal)
+            ? Core.Interpreter.ModuleIdentity.Dynamic(database, name)
+            : new Core.Interpreter.ModuleIdentity(database, schema, name, IsScript: false);
+
     private string BuildVirtualDocPath(Core.Interpreter.ModuleIdentity module)
         => $"{VirtualDocScheme}/{Uri.EscapeDataString(_launchConfig!.Server)}/{Uri.EscapeDataString(_launchConfig.Database)}/" +
            $"{Uri.EscapeDataString(module.Schema ?? "dbo")}.{Uri.EscapeDataString(module.Name)}.sql";
@@ -654,7 +664,7 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
             return;
         }
 
-        var identity = new Core.Interpreter.ModuleIdentity(database, schema, name, IsScript: false);
+        var identity = ModuleIdentityFromVirtualDoc(database, schema, name);
         await _executor.Gate.WaitAsync().ConfigureAwait(false);
         try
         {

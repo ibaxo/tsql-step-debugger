@@ -659,10 +659,16 @@ public sealed class SessionFramesM4Tests
         await session.TeardownAsync();
     }
 
-    // ---- ineligible callee shapes fall back to step-over with a note ------------------
+    // ---- A58 (§11.6): dynamic SQL pushes a DYNAMIC FRAME ------------------------------
+    //
+    // These replace the pre-A58 test that pinned "dynamic SQL always falls back to
+    // step-over (C10)". That refusal WAS the caveat; A58 retires it, so the assertion
+    // inverts: the debugger must now push a frame over the runtime text. The step-over
+    // path is still pinned below — but only for the shapes §11.6 declares ineligible,
+    // where stepping over is the faithful answer (the engine raises its own error).
 
     [Fact]
-    public async Task StepInto_DynamicSql_FallsBackToStepOver_WithNote()
+    public async Task StepInto_ExecString_PushesDynamicFrameOverTheRuntimeText()
     {
         const string script = """
             DECLARE @s nvarchar(100) = N'SELECT 1';
@@ -671,7 +677,125 @@ public sealed class SessionFramesM4Tests
             """;
         var executor = Init(new FakeStatementExecutor())
             .Then(_ => Ok(state: new object?[] { "SELECT 1" }))        // DECLARE initializer
-            .Then(_ => Ok(state: new object?[] { "SELECT 1" }));       // the EXEC itself, stepped over
+            .Then(_ => Ok(userSets: new[] { Scalar("p", "SELECT 1") }))// §11.3 step 1: evaluate the @s expression
+            .ThenEmpty()                                               // push: CREATE TABLE #__dbg_s1 (no formals)
+            .ThenEmpty();                                              // push: seed INSERT … DEFAULT VALUES
+        var session = ScriptSession(script, executor);
+        await session.InitializeAsync();
+        await session.StepAsync();                                     // DECLARE
+
+        await session.StepAsync(StepKind.Into);                        // EXEC(@s) → push a dynamic frame
+
+        Assert.Equal(StepDisposition.SteppedIn, session.LastStep.Disposition);
+        Assert.Equal(2, session.Frames.Count);
+        Assert.True(session.TopFrame!.Module.IsDynamic);
+        Assert.False(session.TopFrame.Module.IsScript);
+        Assert.StartsWith("dynamic SQL #", session.TopFrame.Module.Display);
+        Assert.Equal(2, session.TopFrame.Module.NestCost);             // fact 33e: sp_executesql/EXEC() costs 2 levels
+        // The frame's source IS the runtime string — §5.3's "text plus offsets into that
+        // text" model, so the cursor sits on line 1 OF THE DYNAMIC TEXT (fact 33c).
+        Assert.Equal("SELECT 1", session.TopFrame.Cursor.Index.FullScript);
+        Assert.Equal(1, session.Current!.Span.StartLine);
+        await session.TeardownAsync();
+    }
+
+    [Fact]
+    public async Task StepInto_SpExecuteSql_PushesDynamicFrame_WithDeclaredParamsSeeded()
+    {
+        const string script = """
+            DECLARE @in int = 5, @out int;
+            EXEC sp_executesql N'SET @b = @a + 1;', N'@a int, @b int OUTPUT', @a = @in, @b = @out OUTPUT;
+            SELECT @out AS o;
+            """;
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => Ok(state: new object?[] { 5, null }))            // DECLARE initializers
+            .ThenEmpty()                                                // blueprint fetch: sp_executesql has NO sys.sql_modules row
+            .Then(_ => Ok(userSets: new[] { Scalar("p", "SET @b = @a + 1;") }))   // @statement eval
+            .Then(_ => Ok(userSets: new[] { Scalar("p", "@a int, @b int OUTPUT") }))  // @params eval
+            .Then(_ => Ok(userSets: new[] { Scalar("p", 5) }))          // user arg @a = @in
+            .Then(_ => Ok(userSets: new[] { Scalar("p", null) }))       // user arg @b = @out (OUTPUT is copy-in/copy-out)
+            .ThenEmpty()                                                // push: CREATE TABLE
+            .ThenEmpty()                                                // push: seed INSERT
+            .ThenEmpty()                                                // push: reseed UPDATE (evaluated args)
+            .Then(_ => Row(5, null));                                   // push: seeded-snapshot read-back
+        var session = ScriptSession(script, executor);
+        await session.InitializeAsync();
+        await session.StepAsync();                                      // DECLARE
+
+        await session.StepAsync(StepKind.Into);                         // EXEC sp_executesql → push
+
+        Assert.Equal(StepDisposition.SteppedIn, session.LastStep.Disposition);
+        Assert.Equal(2, session.Frames.Count);
+        Assert.True(session.TopFrame!.Module.IsDynamic);
+        Assert.Equal("SET @b = @a + 1;", session.TopFrame.Cursor.Index.FullScript);
+
+        // The @params string became the frame's formals — parsed, registered, and seeded
+        // with the evaluated actuals, exactly as a procedure's parameters would be.
+        Assert.Equal(new[] { "@a", "@b" }, session.TopFrame.Variables.All.Select(v => v.Declaration.Name));
+        Assert.Equal(new object?[] { 5, null }, session.TopFrame.Snapshot);
+
+        // The OUTPUT pairing is recorded on the call site, so §11.5's completed pop copies
+        // @b back into the caller's @out — the same machinery a procedure OUTPUT uses.
+        var pair = Assert.Single(session.TopFrame.CallSite!.OutputPairs);
+        Assert.Equal("@out", pair.CallerVariable);
+        Assert.Equal("@b", pair.CalleeParameter);
+        await session.TeardownAsync();
+    }
+
+    [Fact]
+    public async Task StepInto_SpExecuteSql_ShadowedByAUserProcedure_StepsIntoThatProcedure()
+    {
+        // An `sp_`-prefixed name resolves in the CURRENT database first, so a user procedure
+        // named sp_executesql is what the engine would actually execute. §11.6 only claims the
+        // name when the catalog fetch comes back empty — so this must step into the user's proc,
+        // not build a dynamic frame out of its first argument.
+        const string script = """
+            DECLARE @s nvarchar(100) = N'SELECT 1';
+            EXEC dbo.sp_executesql @stmt = @s;
+            SELECT 1 AS z;
+            """;
+        const string calleeDef = """
+            CREATE PROCEDURE dbo.sp_executesql @stmt nvarchar(100) AS
+            BEGIN
+            SELECT @stmt AS echoed;
+            END
+            """;
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => Ok(state: new object?[] { "SELECT 1" }));        // DECLARE initializer
+        QueuePush(executor, calleeDef, "SELECT 1");
+        var session = ScriptSession(script, executor);
+        await session.InitializeAsync();
+        await session.StepAsync();
+
+        await session.StepAsync(StepKind.Into);
+
+        Assert.Equal(StepDisposition.SteppedIn, session.LastStep.Disposition);
+        Assert.False(session.TopFrame!.Module.IsDynamic);              // a real module, not a dynamic frame
+        Assert.Equal(1, session.TopFrame.Module.NestCost);
+        // The frame's text is the PROCEDURE'S BODY — not the `SELECT 1` its argument carries,
+        // which is what a wrongly-eager sp_executesql match would have stepped into.
+        Assert.Equal(calleeDef, session.TopFrame.Cursor.Index.FullScript);
+        Assert.Contains("@stmt", session.TopFrame.Variables.All.Single().Declaration.Name);
+        await session.TeardownAsync();
+    }
+
+    // ---- ineligible callee shapes fall back to step-over with a note ------------------
+
+    [Fact]
+    public async Task StepInto_SpExecuteSql_VarcharStatement_FallsBackToStepOver()
+    {
+        // A varchar @statement is engine msg 214. Stepping INTO it would let the debugger
+        // succeed where production fails — hiding the user's bug — so §11.6 refuses before
+        // evaluating anything, and the native EXEC raises the 214 itself.
+        const string script = """
+            DECLARE @s varchar(100) = 'SELECT 1';
+            EXEC sp_executesql @s;
+            SELECT 1 AS z;
+            """;
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => Ok(state: new object?[] { "SELECT 1" }))         // DECLARE initializer
+            .ThenEmpty()                                                // blueprint fetch: no row
+            .Then(_ => Ok(state: new object?[] { "SELECT 1" }));        // the EXEC itself, stepped over
         var session = ScriptSession(script, executor);
         await session.InitializeAsync();
         await session.StepAsync();
@@ -679,8 +803,63 @@ public sealed class SessionFramesM4Tests
         var (_, messages) = await session.StepAsync(StepKind.Into);
 
         Assert.Equal(StepDisposition.Performed, session.LastStep.Disposition);
-        Assert.Single(session.Frames);                                 // no push
-        Assert.Contains(messages, m => m.Contains("C10"));
+        Assert.Single(session.Frames);                                  // no push
+        Assert.Contains(messages, m => m.Contains("not provably nvarchar"));
+        await session.TeardownAsync();
+    }
+
+    [Fact]
+    public async Task StepInto_DynamicSql_ContainingGo_FallsBackToStepOver()
+    {
+        // GO is not a T-SQL statement: inside dynamic SQL it is engine msg 102. ScriptDom would
+        // happily split it into batches, so §11.6 refuses the multi-batch parse rather than
+        // inventing semantics the engine does not have.
+        const string script = """
+            DECLARE @s nvarchar(100) = N'PRINT 1
+            GO
+            PRINT 2';
+            EXEC (@s);
+            SELECT 1 AS z;
+            """;
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => Ok(state: new object?[] { "PRINT 1\nGO\nPRINT 2" }))
+            .Then(_ => Ok(userSets: new[] { Scalar("p", "PRINT 1\nGO\nPRINT 2") }))  // @s eval
+            .Then(_ => Ok(state: new object?[] { "PRINT 1\nGO\nPRINT 2" }));         // stepped over
+        var session = ScriptSession(script, executor);
+        await session.InitializeAsync();
+        await session.StepAsync();
+
+        var (_, messages) = await session.StepAsync(StepKind.Into);
+
+        Assert.Equal(StepDisposition.Performed, session.LastStep.Disposition);
+        Assert.Single(session.Frames);
+        Assert.Contains(messages, m => m.Contains("GO batch separator"));
+        await session.TeardownAsync();
+    }
+
+    [Fact]
+    public async Task StepInto_DynamicSql_ThatDoesNotParse_FallsBackToStepOver()
+    {
+        // A47's server-as-oracle rule: when we cannot model it, let the engine speak. Stepping
+        // over runs the EXEC natively, so the user sees the server's own syntax error.
+        const string script = """
+            DECLARE @s nvarchar(100) = N'SELECT FROM WHERE';
+            EXEC (@s);
+            SELECT 1 AS z;
+            """;
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => Ok(state: new object?[] { "SELECT FROM WHERE" }))
+            .Then(_ => Ok(userSets: new[] { Scalar("p", "SELECT FROM WHERE") }))     // @s eval
+            .Then(_ => Ok(state: new object?[] { "SELECT FROM WHERE" }));            // stepped over
+        var session = ScriptSession(script, executor);
+        await session.InitializeAsync();
+        await session.StepAsync();
+
+        var (_, messages) = await session.StepAsync(StepKind.Into);
+
+        Assert.Equal(StepDisposition.Performed, session.LastStep.Disposition);
+        Assert.Single(session.Frames);
+        Assert.Contains(messages, m => m.Contains("did not parse"));
         await session.TeardownAsync();
     }
 
