@@ -1,23 +1,27 @@
 name: Build & Publish Extension
 
 # Manually-triggered release pipeline ("Run workflow" button, or `gh workflow run publish.yml`).
-# Builds a platform-specific VSIX for Windows, Linux and (optionally) macOS, attaches them all
-# to a GitHub pre-release for manual install, and publishes ONLY the Windows build to the VS Code
-# Marketplace. Default is a dry run (build + upload artifacts, nothing published) so the first
-# click cannot surprise you.
+# Builds a platform-specific VSIX for Windows, Linux and (optionally) macOS, then STOPS and waits
+# for a human. On approval it publishes the Windows build to the VS Code Marketplace and attaches
+# every VSIX to a GitHub pre-release for manual install.
 #
-# Real run (dry_run unchecked): build finishes, then the `publish` job PAUSES for a manual
-# approval before anything goes public. During the pause, open the run, download the Windows VSIX
-# from its "Artifacts" section, sideload + test it, then approve to release. Publish + GitHub
-# release follow the approval.
+# How a run goes:
+#   1. `build` compiles each target and uploads its VSIX as a run artifact. Nothing is published.
+#   2. `publish` PAUSES for a required reviewer. This is your window: open the run, download the
+#      VSIX from its "Artifacts" section, sideload it, test it.
+#   3. Approve -> Marketplace publish + GitHub pre-release. Reject (or just cancel the run) ->
+#      nothing goes public and you keep the artifacts. Rejecting IS the dry run; there is no
+#      separate dry-run switch, precisely so there is only ONE thing standing between a build and
+#      a publish, and it is a human.
 #
-# The pause needs a one-time setup: create an Environment named `marketplace`
-# (repo Settings -> Environments -> New environment) with yourself as a Required reviewer.
-# Without that environment the job still runs, just without pausing.
+# THE GATE IS THE ONLY SAFETY. It is enforced by an Environment named `marketplace` carrying a
+# Required reviewer (repo Settings -> Environments). Without that reviewer the `publish` job does
+# NOT pause -- it publishes unattended. If you ever recreate this repo, recreate the environment
+# BEFORE the first run.
 #
 # Requires one secret for the Marketplace step: VSCE_PAT -- an Azure DevOps Personal Access Token
 # with Marketplace > Manage, scoped to the `ibaxo` publisher (a repo secret, or scope it to the
-# `marketplace` environment for extra safety). Dry runs don't need it.
+# `marketplace` environment for extra safety). It is never touched before the gate.
 
 on:
   workflow_dispatch:
@@ -26,11 +30,6 @@ on:
         description: "Version override (e.g. 0.0.1). Blank = use the version in extension/package.json."
         required: false
         type: string
-      dry_run:
-        description: "Dry run: build & upload artifacts only. Uncheck to arm the approval gate, then publish Windows to the Marketplace and cut the GitHub release."
-        required: false
-        default: true
-        type: boolean
       build_mac:
         description: "Also build the macOS (darwin-arm64) VSIX. Off until there is a Mac to validate it."
         required: false
@@ -111,13 +110,26 @@ jobs:
           path: tsql-step-debugger-${{ matrix.target }}.vsix
           if-no-files-found: error
 
-  # Manual approval gate + Marketplace publish. Real runs only. `environment: marketplace` makes
-  # this job WAIT for a required reviewer's approval -- that is the pause where you download and
-  # test the Windows VSIX (from the build's Artifacts) before anything is published. It then
-  # publishes the exact bytes that were built and attached.
+      # The run page is where you pick the VSIX up, so say so on the run page.
+      - name: Note what to do next
+        shell: bash
+        run: |
+          {
+            echo "### VSIX built: \`${{ matrix.target }}\`"
+            echo ""
+            echo "Download it from the **Artifacts** section of this run (\`vsix-${{ matrix.target }}\`), then:"
+            echo '```'
+            echo "code --install-extension tsql-step-debugger-${{ matrix.target }}.vsix"
+            echo '```'
+            echo "Nothing is published until you **approve** the \`publish\` job below."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # THE GATE. `environment: marketplace` carries a Required reviewer, so this job WAITS for a human
+  # before it does anything. That pause is where you download the Windows VSIX from the build's
+  # Artifacts, sideload it and test it. Approve -> it publishes the exact bytes that were built.
+  # Reject -> the run stops here and nothing is published.
   publish:
     needs: build
-    if: ${{ github.event.inputs.dry_run == 'false' }}
     runs-on: ubuntu-latest
     environment: marketplace
     steps:
@@ -138,10 +150,9 @@ jobs:
         run: npx --yes @vscode/vsce@3 publish --packagePath vsix/tsql-step-debugger-win32-x64.vsix
 
   # Collect every built VSIX and publish them as a single GitHub pre-release for manual install.
-  # Runs after `publish`, so it is behind the same approval gate. Real runs only.
+  # Runs after `publish`, so it is behind the same approval gate.
   release:
     needs: [build, publish]
-    if: ${{ github.event.inputs.dry_run == 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
