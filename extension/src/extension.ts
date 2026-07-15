@@ -269,18 +269,35 @@ class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 			let conn = autoUse ? await this.mssql.resolveActiveEditor() : undefined;
 
 			if (!conn) {
-				// Manual choice: saved profiles + a "pick from mssql" entry (when mssql is present).
-				const externalSources: ExternalSource[] = this.mssql.isAvailable()
-					? [
-							{
-								id: MSSQL_SOURCE_ID,
-								label: '$(plug) Pick from SQL Server (mssql)…',
-								detail: 'Use a connection configured in the Microsoft mssql extension',
-								resolve: () => this.mssql.pick(),
-							},
-					  ]
-					: [];
-				conn = await this.store.resolveForLaunch(externalSources);
+				// Manual choice. When mssql is installed, lead with its own connection picker (its
+				// full connection list) — mssql exposes no enumerable list to fold into our own
+				// quickpick, only its native picker. Set `tsqlDbg.mssql.useConnectionPicker` false to
+				// lead with the debugger's own Connection Manager instead, with mssql offered as a
+				// secondary entry. Either way, backing out of one falls through to the other, so a
+				// profile targeting a server mssql doesn't know about is never stranded.
+				const mssqlAvailable = this.mssql.isAvailable();
+				const useMssqlPicker =
+					mssqlAvailable &&
+					vscode.workspace.getConfiguration('tsqlDbg').get<boolean>('mssql.useConnectionPicker', true);
+				if (useMssqlPicker) {
+					conn = await this.mssql.pick();
+				}
+				if (!conn) {
+					// mssql leads → no in-chooser entry (we just came from it); debugger leads → offer
+					// mssql as a secondary "Pick from SQL Server (mssql)…" entry.
+					const externalSources: ExternalSource[] =
+						mssqlAvailable && !useMssqlPicker
+							? [
+								{
+									id: MSSQL_SOURCE_ID,
+									label: '$(plug) Pick from SQL Server (mssql)…',
+									detail: 'Use a connection configured in the Microsoft mssql extension',
+									resolve: () => this.mssql.pick(),
+								},
+							  ]
+							: [];
+					conn = await this.store.resolveForLaunch(externalSources);
+				}
 			}
 			if (!conn) {
 				return undefined; // cancelled — abort the launch quietly (VS Code convention)

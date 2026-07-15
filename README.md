@@ -98,12 +98,17 @@ extension installed with connections configured, you don't have to re-enter them
 - **Automatic** — open a `.sql` file that mssql is connected to and press F5; the debug session
   uses **that same connection**, no picker. (The first time, mssql asks you to approve sharing;
   that consent is remembered.)
-- **On demand** — when you're not on a connected file, the connection chooser includes a
-  **“$(plug) Pick from SQL Server (mssql)…”** entry alongside your own saved profiles.
+- **On demand** — when you're not on a connected file, pressing F5 opens mssql's own
+  connection picker **directly**, listing every connection you've configured there. Pick one
+  to debug with it, or press **Escape** to fall back to the T-SQL Debugger's own
+  saved-connection chooser.
 
-Prefer to always use the T-SQL Debugger's own Connection Manager? Set
-`tsqlDbg.mssql.useActiveEditorConnection` to `false`. *(Azure AD / access-token connections
-aren't supported yet — pick a Windows or SQL-login connection.)*
+Prefer the T-SQL Debugger's own Connection Manager? Set `tsqlDbg.mssql.useConnectionPicker` to
+`false` so the on-demand path leads with your saved profiles instead — mssql then appears as a
+secondary **“$(plug) Pick from SQL Server (mssql)…”** entry rather than taking over. To also
+stop the automatic active-file reuse, set `tsqlDbg.mssql.useActiveEditorConnection` to `false`.
+*(Azure AD / access-token connections aren't supported yet — pick a Windows or SQL-login
+connection.)*
 
 ## Safety
 
@@ -241,6 +246,7 @@ for procedure mode) really matters; the rest have sensible defaults.
 | Setting | Default | Description |
 |---|---|---|
 | `tsqlDbg.mssql.useActiveEditorConnection` | `true` | Auto-use the active `.sql` file's mssql connection when set. |
+| `tsqlDbg.mssql.useConnectionPicker` | `true` | At launch, open mssql's own connection picker first. Set `false` to lead with the debugger's Connection Manager, with mssql as a secondary entry. |
 | `tsqlDbg.adapterPath` | — | Dev override: absolute path to a locally-built `TsqlDbg.Adapter`. |
 
 ---

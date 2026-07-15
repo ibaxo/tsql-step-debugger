@@ -48,6 +48,11 @@
           "type": "boolean",
           "default": true,
           "description": "When the active .sql file is connected in the Microsoft \"SQL Server (mssql)\" extension, debug against that same connection automatically (no connection picker). The first use prompts mssql to approve connection sharing. Turn this off to always use the T-SQL Debugger's own Connection Manager."
+        },
+        "tsqlDbg.mssql.useConnectionPicker": {
+          "type": "boolean",
+          "default": true,
+          "description": "When you pick a connection at launch and the Microsoft \"SQL Server (mssql)\" extension is installed, open its own connection picker first (its full connection list). Turn this off to lead with the T-SQL Debugger's own Connection Manager instead; mssql then appears as a secondary \"Pick from SQL Server (mssql)…\" entry. Only affects the manual picker, not the automatic active-file reuse above."
         }
       }
     },
