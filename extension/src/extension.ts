@@ -46,7 +46,10 @@ export function activate(context: vscode.ExtensionContext): void {
 				mode: 'script',
 				...buildScriptSource(editor.document),
 				stopOnEntry: true,
-			});
+			// A60: we debug the buffer's live text (buildScriptSource passes scriptText for unsaved/dirty
+			// docs), so VS Code's save-before-debug step is pure friction here — for an untitled buffer it
+			// pops a Save As dialog. Suppress it; a saved-but-dirty file is read from the live buffer too.
+			}, { suppressSaveBeforeStart: true });
 		}),
 		vscode.commands.registerCommand('tsqldbg.connections.manage', async () => {
 			await store.manage();
