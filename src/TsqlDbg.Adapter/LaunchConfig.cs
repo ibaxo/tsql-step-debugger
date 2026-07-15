@@ -13,6 +13,10 @@ public sealed record LaunchConfig(
     string? Procedure,
     IReadOnlyDictionary<string, string>? Args,
     string? ScriptPath,
+    // DESIGN §17 (A60): inline script body for unsaved/untitled (or dirty) buffers. When
+    // non-null it is debugged verbatim and the adapter never reads ScriptPath from disk;
+    // ScriptPath then only feeds the stack-frame Source (which may be an untitled: URI).
+    string? ScriptText,
     string? TargetsFile,
     string? WorkspaceFolder,
     int CompatLevel,
@@ -83,6 +87,8 @@ public sealed record LaunchConfig(
             GetString(properties, "procedure"),
             args,
             GetString(properties, "script"),
+            // DESIGN §17 (A60): inline body for unsaved buffers; null = read ScriptPath from disk.
+            GetString(properties, "scriptText"),
             GetString(properties, "targetsFile"),
             GetString(properties, "workspaceFolder"),
             // DESIGN §2 (A57): product default 0 = auto (parser chosen from the server's product

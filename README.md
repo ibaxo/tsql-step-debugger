@@ -59,7 +59,10 @@ Set a breakpoint in a `.sql` file, press **F5**, and step.
 ## Debugging a T-SQL script
 
 The **▷ Debug T-SQL Script** button and **F5** both debug the active `.sql` file with no
-`launch.json` at all — script mode is the default. Add a `launch.json` entry when you want to
+`launch.json` at all — script mode is the default. The file **doesn't have to be saved**: open a
+new untitled buffer (or one with unsaved edits), type your T-SQL, and press F5 — the exact text
+on screen is debugged in place, nothing is written to disk, and breakpoints and the step arrow
+land in that same editor. Add a `launch.json` entry when you want to
 tweak an option; *Run and Debug → create a launch.json file* generates exactly this, which
 behaves identically to the button, with **every option at its default**:
 
@@ -143,7 +146,8 @@ for procedure mode) really matters; the rest have sensible defaults.
 |---|---|---|---|
 | `mode` | `script` \| `procedure` | `script` | Debug the active `.sql` file, or a deployed module. |
 | `server` / `database` | string | *(pick at launch)* | Omit (recommended) to choose a saved connection (Connection Manager). |
-| `script` | string | `${file}` | The `.sql` file to debug (script mode). |
+| `script` | string | `${file}` | The `.sql` file to debug (script mode). For an unsaved buffer this is the editor URI, set automatically. |
+| `scriptText` | string | — | Inline script body, run verbatim with no file read. Set automatically for unsaved/dirty buffers — you normally never write this by hand. |
 | `procedure` | string | — | Two/three-part name; required for `mode: procedure`. |
 | `args` | object | `{}` | Parameter → T-SQL literal, e.g. `{ "@Id": "42" }` (procedure mode). |
 | `stopOnEntry` | boolean | `true` | Stop at the first statement before running. |

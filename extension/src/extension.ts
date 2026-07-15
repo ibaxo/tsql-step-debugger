@@ -26,8 +26,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		// config provider below fills the connection from the Connection Manager.
 		vscode.commands.registerCommand('tsqldbg.debugEditorScript', async () => {
 			const editor = vscode.window.activeTextEditor;
-			if (!editor || editor.document.languageId !== 'sql') {
-				void vscode.window.showInformationMessage('Open a .sql file to debug it as a T-SQL script.');
+			// A60: allow an untitled buffer even if its language isn't SQL yet — a brand-new
+			// "New File" starts as plaintext, and the whole point is to debug it without first
+			// saving (and thus without VS Code inferring .sql). A *saved* file still must be SQL.
+			if (!editor || (editor.document.languageId !== 'sql' && !editor.document.isUntitled)) {
+				void vscode.window.showInformationMessage('Open a .sql file (or an unsaved buffer) to debug it as a T-SQL script.');
 				return;
 			}
 			await vscode.debug.startDebugging(vscode.workspace.getWorkspaceFolder(editor.document.uri), {
@@ -35,7 +38,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				request: 'launch',
 				name: 'Debug T-SQL script',
 				mode: 'script',
-				script: editor.document.uri.fsPath,
+				...buildScriptSource(editor.document),
 				stopOnEntry: true,
 			});
 		}),
@@ -146,6 +149,21 @@ class TsqlSourceContentProvider implements vscode.TextDocumentContentProvider {
 	}
 }
 
+// DESIGN §17 (A60): resolve the script-mode source of an editor document into launch fields.
+// For an unsaved/untitled buffer — or a saved file with pending edits — pass the LIVE buffer
+// text as `scriptText` so the adapter debugs exactly what's on screen without a disk read (or a
+// temp file). `script` still carries a path/URI the client can map the step arrow onto: the real
+// filesystem path for a saved file (dirty or not), or the untitled: URI for an unsaved one.
+function buildScriptSource(document: vscode.TextDocument): { script: string; scriptText?: string } {
+	if (document.isUntitled) {
+		return { script: document.uri.toString(), scriptText: document.getText() };
+	}
+	if (document.isDirty) {
+		return { script: document.uri.fsPath, scriptText: document.getText() };
+	}
+	return { script: document.uri.fsPath };
+}
+
 export function deactivate(): void {
 	// Nothing to clean up: the adapter process owns its own connection/transaction lifecycle
 	// (DESIGN.md §4 teardown) and exits on `disconnect`.
@@ -168,7 +186,8 @@ class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 		// "just works" (procedure mode is an explicit config; see the README).
 		if (!config.type && !config.request && !config.name) {
 			const editor = vscode.window.activeTextEditor;
-			if (editor && editor.document.languageId === 'sql') {
+			// A60: an unsaved buffer is a valid F5 target even before its language is SQL.
+			if (editor && (editor.document.languageId === 'sql' || editor.document.isUntitled)) {
 				config.type = 'tsql';
 				config.request = 'launch';
 				config.name = 'Debug T-SQL script';
@@ -184,9 +203,19 @@ class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 		if (!config.mode) {
 			config.mode = config.procedure ? 'procedure' : 'script';
 		}
-		// Script mode defaults to the .sql file you're editing.
+		// Script mode defaults to the document you're editing. A60: an unsaved/untitled (or
+		// dirty) buffer contributes its live text as `scriptText` so it debugs without saving.
 		if (config.mode === 'script' && !config.script) {
-			config.script = vscode.window.activeTextEditor?.document.uri.fsPath ?? '${file}';
+			const document = vscode.window.activeTextEditor?.document;
+			if (document) {
+				const source = buildScriptSource(document);
+				config.script = source.script;
+				if (source.scriptText !== undefined) {
+					config.scriptText = source.scriptText;
+				}
+			} else {
+				config.script = '${file}';
+			}
 		}
 
 		if (folder && !config.workspaceFolder) {

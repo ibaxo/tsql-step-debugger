@@ -35,6 +35,29 @@ public sealed class LaunchConfigTests
     }
 
     [Fact]
+    public void Parse_NoScriptText_DefaultsNull()
+    {
+        // A60: absent scriptText => null (adapter falls back to reading the file path).
+        var config = LaunchConfig.Parse(BaseProperties());
+
+        Assert.Null(config.ScriptText);
+    }
+
+    [Fact]
+    public void Parse_ScriptText_ThreadsVerbatim()
+    {
+        // A60: an unsaved buffer's inline body threads through untouched.
+        var properties = BaseProperties();
+        properties["script"] = "untitled:Untitled-1";
+        properties["scriptText"] = "SELECT 1;\nGO\nSELECT 2;";
+
+        var config = LaunchConfig.Parse(properties);
+
+        Assert.Equal("SELECT 1;\nGO\nSELECT 2;", config.ScriptText);
+        Assert.Equal("untitled:Untitled-1", config.ScriptPath);
+    }
+
+    [Fact]
     public void Parse_SI15Knobs_ThreadThroughWithDefaults()
     {
         var config = LaunchConfig.Parse(BaseProperties());

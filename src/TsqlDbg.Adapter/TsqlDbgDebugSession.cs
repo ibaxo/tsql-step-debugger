@@ -946,7 +946,7 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         if (frame.Module.IsScript && _launchConfig.Mode == LaunchMode.Script)
         {
             var scriptPath = _launchConfig.ScriptPath;
-            return scriptPath is null ? null : new Source { Name = Path.GetFileName(scriptPath), Path = scriptPath };
+            return scriptPath is null ? null : new Source { Name = FrameSourceName(scriptPath), Path = scriptPath };
         }
 
         if (_liveSession is not null && _liveSession.Session.TryGetSourceMapFile(frame.Module, out var file) && file is not null)
@@ -955,6 +955,21 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         }
 
         return new Source { Name = frame.Module.Display, Path = BuildVirtualDocPath(frame.Module) };
+    }
+
+    // A60: the script frame's Source.Path may be a real filesystem path OR an unsaved buffer's
+    // URI (e.g. "untitled:Untitled-1"). Path.GetFileName leaves a scheme-prefixed URI intact
+    // (no directory separator to split on), so derive a readable tab name from the URI's last
+    // segment instead; a plain path stays exactly as before.
+    private static string FrameSourceName(string scriptPath)
+    {
+        if (Uri.TryCreate(scriptPath, UriKind.Absolute, out var uri) && !uri.IsFile && uri.Scheme != "tsqldbg")
+        {
+            var tail = scriptPath.Split('/', '\\').Last();
+            return tail.Length > 0 ? tail : scriptPath;
+        }
+
+        return Path.GetFileName(scriptPath);
     }
 
     protected override ScopesResponse HandleScopesRequest(ScopesArguments arguments)
@@ -2809,12 +2824,21 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         string? scriptText = null;
         if (config.Mode == LaunchMode.Script)
         {
-            if (string.IsNullOrWhiteSpace(config.ScriptPath))
+            // A60: an unsaved/untitled (or dirty) buffer arrives as inline `scriptText` — debug it
+            // verbatim, never touching the disk (ScriptPath is then only a Source hint, e.g. an
+            // untitled: URI). Otherwise fall back to reading the named file.
+            if (config.ScriptText is not null)
             {
-                throw new ProtocolException("launch config 'script' is required when mode = script.");
+                scriptText = config.ScriptText;
             }
-
-            scriptText = File.ReadAllText(config.ScriptPath);
+            else if (!string.IsNullOrWhiteSpace(config.ScriptPath))
+            {
+                scriptText = File.ReadAllText(config.ScriptPath);
+            }
+            else
+            {
+                throw new ProtocolException("launch config 'script' (or 'scriptText') is required when mode = script.");
+            }
         }
 
         return new SessionOptions(

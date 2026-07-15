@@ -148,7 +148,11 @@
               "script": {
                 "type": "string",
                 "default": "${file}",
-                "description": "Script path. Required when mode = script."
+                "description": "Script path (or the buffer URI for an unsaved doc). Required when mode = script."
+              },
+              "scriptText": {
+                "type": "string",
+                "description": "Inline script body. When set, the debugger runs this text verbatim (no file read) — used automatically for unsaved/dirty buffers so you can debug without saving."
               },
               "targetsFile": {
                 "type": "string",
