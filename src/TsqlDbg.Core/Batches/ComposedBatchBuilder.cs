@@ -399,6 +399,18 @@ public static class ComposedBatchBuilder
 
         sb.Append("BEGIN TRY\n");
         sb.Append(rewrite.PatchedText.TrimEnd()).Append(rewrite.PatchedText.TrimEnd().EndsWith(';') ? "\n" : ";\n");
+        if (includeTrailingProbe)
+        {
+            // §12.3/C5: capture @@ROWCOUNT the instant the console statement completes —
+            // the state write-back below and the trailing probe would both clobber it.
+            // Filtered out of the user output by ParseReplBatchResult and surfaced only as
+            // the "(N rows affected)" line for a DML write, mirroring the stepped-statement
+            // note. Guarded by includeTrailingProbe (a real table/row write); a variable-only
+            // `SET @x` gets no probe and needs no rowcount. Inside the TRY, so a faulted
+            // statement skips it (jumps to CATCH) — no rowcount for a rolled-back write.
+            sb.Append("SELECT @@ROWCOUNT AS __dbg_repl_rowcount;\n");
+        }
+
         if (includeStateWriteback && variables.Count > 0)
         {
             // A46 (§12.3): a write-mode console statement persists its variable changes

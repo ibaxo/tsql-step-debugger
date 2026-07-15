@@ -73,6 +73,13 @@ public sealed class SessionReplTests
         return result with { ResultSets = result.ResultSets.Append(probeSet).ToList() };
     }
 
+    private static BatchResult WithReplRowcount(BatchResult result, int rowCount)
+    {
+        var set = new ResultSet(
+            new[] { "__dbg_repl_rowcount" }, new IReadOnlyList<object?>[] { new object?[] { rowCount } });
+        return result with { ResultSets = result.ResultSets.Prepend(set).ToList() };
+    }
+
     private static Session ScriptSession(string script, FakeStatementExecutor executor, bool allowConsoleWrites = false)
         => new(new SessionOptions("DEVSQL01", "SalesDb", LaunchMode.Script, null, null, script, AllowConsoleWrites: allowConsoleWrites), executor);
 
@@ -133,6 +140,41 @@ public sealed class SessionReplTests
         Assert.Equal(Session.ReplOutcome.Rendered, result.Outcome);
         Assert.Contains("OK", result.Rendered);
         Assert.DoesNotContain("no result sets", result.Rendered);
+        await session.TeardownAsync();
+    }
+
+    [Fact]
+    public async Task Dml_Write_EmitsRowsAffected()
+    {
+        // C5/§12.3: NOCOUNT is forced on, so the debugger synthesizes "(N rows affected)"
+        // from the @@ROWCOUNT captured right after the write (the __dbg_repl_rowcount marker).
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => WithReplRowcount(WithProbe(Empty(), trancount: 1, xactState: 0), rowCount: 3));
+        var session = ScriptSession("SELECT 1;", executor, allowConsoleWrites: true);
+        await session.InitializeAsync();
+        var frame = session.Frames[0];
+
+        var result = await session.EvaluateReplAsync(frame, "DELETE FROM dbo.T WHERE a > 0;");
+
+        Assert.Equal(Session.ReplOutcome.Rendered, result.Outcome);
+        Assert.Contains("(3 rows affected)", result.Rendered);
+        Assert.Contains("__dbg_repl_rowcount", executor.ReceivedBatches[^1]);   // capture emitted
+        await session.TeardownAsync();
+    }
+
+    [Fact]
+    public async Task Dml_Write_SingleRow_UsesSingularWording()
+    {
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => WithReplRowcount(WithProbe(Empty(), trancount: 1, xactState: 0), rowCount: 1));
+        var session = ScriptSession("SELECT 1;", executor, allowConsoleWrites: true);
+        await session.InitializeAsync();
+        var frame = session.Frames[0];
+
+        var result = await session.EvaluateReplAsync(frame, "INSERT INTO dbo.T (a) VALUES (1);");
+
+        Assert.Equal(Session.ReplOutcome.Rendered, result.Outcome);
+        Assert.Contains("(1 row affected)", result.Rendered);
         await session.TeardownAsync();
     }
 

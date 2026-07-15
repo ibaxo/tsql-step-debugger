@@ -1101,7 +1101,7 @@ public sealed class Session
                 $"console statement faulted: {ex.Message} (error {ex.Number}).");
         }
 
-        var (userSets, fault, probe, stateValues) = ParseReplBatchResult(batchResult);
+        var (userSets, fault, probe, stateValues, rowCount) = ParseReplBatchResult(batchResult);
 
         // §12.3 "messages inline": surface the batch's own PRINT / low-severity RAISERROR
         // (sev ≤ 10 arrives as an InfoMessage, fact 18) output to the console. This stream
@@ -1111,6 +1111,17 @@ public sealed class Session
         // messages only, never a doubled fault. Ordered after any debugger meta-note (the
         // §10.4 resurrection line) but before the fault line, matching execution order.
         messages.AddRange(batchResult.Messages);
+
+        // C5/§12.3: a DML write's "(N rows affected)" line — NOCOUNT is forced ON so the
+        // engine emits no done-token; synthesize it from the @@ROWCOUNT captured right after
+        // the statement, mirroring the stepped-statement note (AppendRowsAffectedNote). Only
+        // the row-affecting DML family; a faulted statement never reached the capture, so
+        // rowCount is null and nothing is added.
+        if (rowCount is { } rc && statement is InsertStatement or UpdateStatement
+                or DeleteStatement or MergeStatement or SelectStatement { Into: not null })
+        {
+            messages.Add(FormatRowsAffected(rc));
+        }
 
         // A46: a write-mode statement's __dbg_state read-back refreshes the SELECTED
         // frame's binary snapshot (§8.1) — the same refresh the interpreter does every
@@ -1159,12 +1170,14 @@ public sealed class Session
     private static (IReadOnlyList<ResultSet> UserSets,
         (int Number, int Severity, int State, int? Line, string? Procedure, string Message)? Fault,
         (int Trancount, int XactState)? Probe,
-        IReadOnlyList<object?>? StateValues) ParseReplBatchResult(BatchResult result)
+        IReadOnlyList<object?>? StateValues,
+        int? RowCount) ParseReplBatchResult(BatchResult result)
     {
         var userSets = new List<ResultSet>();
         (int, int, int, int?, string?, string)? fault = null;
         (int, int)? probe = null;
         IReadOnlyList<object?>? stateValues = null;
+        int? rowCount = null;
 
         foreach (var rs in result.ResultSets)
         {
@@ -1201,13 +1214,19 @@ public sealed class Session
                 int Col(string name) => columns.ToList().IndexOf(name);
                 probe = (Convert.ToInt32(row[Col("trancount")]), Convert.ToInt32(row[Col("xact_state")]));
             }
+            else if (columns.Contains("__dbg_repl_rowcount") && rs.Rows.Count > 0)
+            {
+                // §12.3/C5: the @@ROWCOUNT captured right after a write statement — never
+                // rendered as a user set; feeds the "(N rows affected)" line for DML.
+                rowCount = Convert.ToInt32(rs.Rows[0][0]);
+            }
             else
             {
                 userSets.Add(rs);
             }
         }
 
-        return (userSets, fault, probe, stateValues);
+        return (userSets, fault, probe, stateValues, rowCount);
     }
 
     // §12.3: "render: result sets as aligned text tables capped at maxConsoleRows
@@ -2796,8 +2815,37 @@ public sealed class Session
         }
 
         ObserveDebuggeeSuccess(run.Control!, unit);   // §7.4/A26 (D1): R6 chain-sync gate
+        AppendRowsAffectedNote(unit, run.Control!, messages);
         return null;
     }
+
+    // C5 (§12.3): the debugger forces SET NOCOUNT ON, which suppresses the engine's
+    // native "(N rows affected)" done-token messages. Re-synthesize that line for the
+    // row-affecting DML family from the control row's captured @@ROWCOUNT (control.Rc —
+    // the same value the R4 shadow reads, captured immediately after the statement, so it
+    // is faithful). A plain SELECT is excluded: its row count is conveyed by the rendered
+    // result-set table (A50), so the line there would just be noise. Kept on the always-
+    // shown message stream (not a §12.3 verbose diagnostic note): it is debuggee output
+    // the user explicitly asked to see, mirroring SSMS.
+    private static void AppendRowsAffectedNote(Interpreter.StatementUnit unit, ControlRow control, List<string> messages)
+    {
+        if (control.Rc is not { } rowCount)
+        {
+            return;
+        }
+
+        var isRowAffectingDml = unit.Fragment is InsertStatement or UpdateStatement
+            or DeleteStatement or MergeStatement
+            || unit.Fragment is SelectStatement { Into: not null };   // SELECT … INTO is a bulk insert
+        if (isRowAffectingDml)
+        {
+            messages.Add(FormatRowsAffected(rowCount));
+        }
+    }
+
+    // Native wording: "(1 row affected)" / "(N rows affected)" — matches SSMS / ADO.NET.
+    private static string FormatRowsAffected(int rowCount)
+        => $"({rowCount} row{(rowCount == 1 ? string.Empty : "s")} affected)";
 
     // §10.3 routing, session half. M4 (D3): step 2's walk crosses frames. Cursor
     // placement per branch:
