@@ -43,6 +43,11 @@
           "type": "string",
           "default": null,
           "description": "Dev override: absolute path to a locally-built TsqlDbg.Adapter executable, instead of the one bundled with this extension."
+        },
+        "tsqlDbg.mssql.useActiveEditorConnection": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the active .sql file is connected in the Microsoft \"SQL Server (mssql)\" extension, debug against that same connection automatically (no connection picker). The first use prompts mssql to approve connection sharing. Turn this off to always use the T-SQL Debugger's own Connection Manager."
         }
       }
     },

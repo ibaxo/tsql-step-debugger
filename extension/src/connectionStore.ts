@@ -27,9 +27,17 @@ export interface ConnectionProfile {
 	options?: string; // extra raw connection-string fragment
 }
 
-/** The launch fields a profile resolves to (password fetched separately, via secrets). */
+/**
+ * The launch fields a connection resolves to. A saved profile carries `profileId` (its SQL
+ * password is fetched separately from SecretStorage by the descriptor factory). An *external*
+ * source (e.g. the ms-mssql.mssql extension — see mssqlConnections.ts) has no saved profile, so
+ * it carries its SQL password inline as `password` — the caller must route this out-of-band
+ * (an ephemeral token → env var), NEVER into the DAP config, launch.json, logs, or the --trace.
+ */
 export interface ResolvedConnection {
-	profileId: string;
+	profileId?: string; // set for saved profiles (SecretStorage password ref)
+	password?: string; // set for external sources only; in-memory, never persisted/logged
+	label?: string; // human name of the source connection (for the session/status UI)
 	server: string; // host, host\instance, or host,port
 	database: string;
 	authType: AuthType;
@@ -37,6 +45,22 @@ export interface ResolvedConnection {
 	encrypt: boolean;
 	options?: string; // TrustServerCertificate + profile.options, appended raw
 }
+
+/**
+ * An out-of-Connection-Manager connection provider surfaced in the launch chooser (the
+ * ms-mssql.mssql bridge). `resolve()` runs the source's own picker and returns launch fields
+ * (or undefined if the user backed out). Kept as an interface so connectionStore.ts stays free
+ * of any mssql dependency (CLAUDE.md: extension = wiring).
+ */
+export interface ExternalSource {
+	id: string;
+	label: string; // QuickPick label (may include a $(codicon))
+	detail?: string;
+	resolve: () => Promise<ResolvedConnection | undefined>;
+}
+
+/** Outcome of the launch chooser: a saved profile, or an already-resolved external connection. */
+export type LaunchPick = { kind: 'profile'; profile: ConnectionProfile } | { kind: 'resolved'; resolved: ResolvedConnection };
 
 const PROFILES_KEY = 'tsqldbg.connections.profiles';
 const ACTIVE_KEY = 'tsqldbg.connections.activeId';
@@ -69,10 +93,16 @@ export class ConnectionStore {
 		return this.context.secrets.get(secretKey(id));
 	}
 
-	/** Resolve the active profile (or pick/create one) into launch fields. Undefined = cancel. */
-	async resolveForLaunch(): Promise<ResolvedConnection | undefined> {
-		const profile = await this.pickForLaunch();
-		return profile ? this.toResolved(profile) : undefined;
+	/**
+	 * Resolve a connection into launch fields. Undefined = cancel. `externalSources` (the mssql
+	 * bridge) appear as extra chooser entries; an external pick returns already-resolved fields.
+	 */
+	async resolveForLaunch(externalSources: ExternalSource[] = []): Promise<ResolvedConnection | undefined> {
+		const pick = await this.pickForLaunch(externalSources);
+		if (!pick) {
+			return undefined;
+		}
+		return pick.kind === 'resolved' ? pick.resolved : this.toResolved(pick.profile);
 	}
 
 	toResolved(p: ConnectionProfile): ResolvedConnection {
@@ -223,25 +253,37 @@ export class ConnectionStore {
 		if (picked) await this.setActive(picked.id);
 	}
 
-	/** Launch-time chooser: MRU-first list + add/manage; accepting sets it active. */
-	async pickForLaunch(): Promise<ConnectionProfile | undefined> {
-		if (this.getProfiles().length === 0) {
+	/** Launch-time chooser: MRU-first list + external sources + add/manage; accepting sets it active. */
+	async pickForLaunch(externalSources: ExternalSource[] = []): Promise<LaunchPick | undefined> {
+		if (this.getProfiles().length === 0 && externalSources.length === 0) {
 			await this.offerToCreate();
-			return this.getActive();
+			const active = this.getActive();
+			return active ? { kind: 'profile', profile: active } : undefined;
 		}
 		for (;;) {
-			const outcome = await this.pickLaunchAction();
+			const outcome = await this.pickLaunchAction(externalSources);
 			switch (outcome.kind) {
 				case 'cancel':
 					return undefined;
-				case 'accept':
+				case 'accept': {
 					await this.setActive(outcome.id);
-					return this.getProfiles().find((p) => p.id === outcome.id);
+					const profile = this.getProfiles().find((p) => p.id === outcome.id);
+					if (profile) return { kind: 'profile', profile };
+					break;
+				}
+				case 'external': {
+					// Run the source's own picker (e.g. mssql's connection quickpick). Backing out
+					// returns us to this chooser rather than cancelling the whole launch.
+					const source = externalSources.find((s) => s.id === outcome.id);
+					const resolved = source ? await source.resolve() : undefined;
+					if (resolved) return { kind: 'resolved', resolved };
+					break;
+				}
 				case 'add': {
 					const added = await this.addConnection();
 					if (!added) break;
 					await this.setActive(added.id);
-					return added;
+					return { kind: 'profile', profile: added };
 				}
 				case 'manage':
 					await this.manage();
@@ -256,7 +298,7 @@ export class ConnectionStore {
 		}
 	}
 
-	private pickLaunchAction(): Promise<LaunchOutcome> {
+	private pickLaunchAction(externalSources: ExternalSource[]): Promise<LaunchOutcome> {
 		const editButton: vscode.QuickInputButton = { iconPath: new vscode.ThemeIcon('edit'), tooltip: 'Edit' };
 		const deleteButton: vscode.QuickInputButton = { iconPath: new vscode.ThemeIcon('trash'), tooltip: 'Delete' };
 
@@ -278,6 +320,12 @@ export class ConnectionStore {
 					id: p.id,
 					profileName: p.name,
 				})),
+				...externalSources.map<LaunchItem>((s) => ({
+					label: s.label,
+					description: s.detail,
+					action: 'external' as const,
+					id: s.id,
+				})),
 				{ label: '$(add) Add connection…', action: 'add' },
 				{ label: '$(gear) Manage connections…', action: 'manage' },
 			];
@@ -285,7 +333,8 @@ export class ConnectionStore {
 			let outcome: LaunchOutcome = { kind: 'cancel' };
 			qp.onDidTriggerItemButton((event) => {
 				const { id, profileName } = event.item;
-				if (!id) return;
+				// Only profile items carry buttons; external/add/manage items never trigger this.
+				if (!id || event.item.action === 'external') return;
 				outcome = event.button === editButton ? { kind: 'edit', id } : { kind: 'delete', id, name: profileName ?? id };
 				qp.hide();
 			});
@@ -293,6 +342,7 @@ export class ConnectionStore {
 				const item = qp.selectedItems[0];
 				if (item?.action === 'add') outcome = { kind: 'add' };
 				else if (item?.action === 'manage') outcome = { kind: 'manage' };
+				else if (item?.action === 'external' && item.id) outcome = { kind: 'external', id: item.id };
 				else if (item?.id) outcome = { kind: 'accept', id: item.id };
 				qp.hide();
 			});
@@ -626,12 +676,13 @@ type ManageOutcome =
 	| { kind: 'close' };
 
 interface LaunchItem extends vscode.QuickPickItem {
-	action?: 'accept' | 'add' | 'manage';
+	action?: 'accept' | 'add' | 'manage' | 'external';
 	id?: string;
 	profileName?: string;
 }
 type LaunchOutcome =
 	| { kind: 'accept'; id: string }
+	| { kind: 'external'; id: string }
 	| { kind: 'edit'; id: string }
 	| { kind: 'delete'; id: string; name: string }
 	| { kind: 'add' }

@@ -2,7 +2,9 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import { ConnectionStore } from './connectionStore';
+import { randomUUID } from 'crypto';
+import { ConnectionStore, ExternalSource, ResolvedConnection } from './connectionStore';
+import { MssqlConnectionBridge, MSSQL_SOURCE_ID } from './mssqlConnections';
 
 // DESIGN.md §17 + CLAUDE.md orientation: "extension/ — TypeScript VS Code shell (DAP wiring
 // only; no logic)." Everything here is registration/wiring: resolving the adapter executable
@@ -13,10 +15,14 @@ import { ConnectionStore } from './connectionStore';
 
 export function activate(context: vscode.ExtensionContext): void {
 	const store = new ConnectionStore(context, () => resolveAdapterPath(context));
+	const mssql = new MssqlConnectionBridge();
+	// Holds SQL passwords sourced from mssql for the brief window between config resolution and
+	// adapter spawn (see SAFETY note on TsqlDebugConfigurationProvider). Never persisted.
+	const ephemeralSecrets = new EphemeralSecrets();
 	const connectionStatus = new ConnectionStatusIndicator(context, store);
 	context.subscriptions.push(
-		vscode.debug.registerDebugConfigurationProvider('tsql', new TsqlDebugConfigurationProvider(store)),
-		vscode.debug.registerDebugAdapterDescriptorFactory('tsql', new TsqlDebugAdapterDescriptorFactory(context, store)),
+		vscode.debug.registerDebugConfigurationProvider('tsql', new TsqlDebugConfigurationProvider(store, mssql, ephemeralSecrets)),
+		vscode.debug.registerDebugAdapterDescriptorFactory('tsql', new TsqlDebugAdapterDescriptorFactory(context, store, ephemeralSecrets)),
 		vscode.workspace.registerTextDocumentContentProvider(TsqlSourceContentProvider.scheme, new TsqlSourceContentProvider()),
 		vscode.debug.onDidReceiveDebugSessionCustomEvent(handleCommitConfirmEvent),
 		vscode.debug.onDidStartDebugSession((s) => connectionStatus.onSessionStart(s)),
@@ -169,13 +175,40 @@ export function deactivate(): void {
 	// (DESIGN.md §4 teardown) and exits on `disconnect`.
 }
 
-// DESIGN §16 (A42, M10): when the launch config doesn't pin a server, resolve it from a saved
-// connection profile (the Connection Manager). A pinned server/database is passed through
-// untouched (power users / CI). The password is NEVER placed in the config — the descriptor
-// factory injects it into the adapter via env (§4/A41). The workspaceFolder is still injected
-// so the adapter can resolve ${workspaceFolder}/targets.json (optional metadata, §4 step 1).
+// A one-shot, in-memory registry for SQL passwords sourced from the mssql extension. A saved
+// profile's password lives in SecretStorage keyed by its profile id; an mssql-sourced connection
+// has no profile, so its password is stashed here under a random token that the (traceable) DAP
+// config carries in our place — the descriptor factory redeems the token for the password and
+// injects it as an env var. The password itself never enters the config, launch.json, or --trace.
+class EphemeralSecrets {
+	private readonly map = new Map<string, string>();
+
+	put(secret: string): string {
+		const token = randomUUID();
+		this.map.set(token, secret);
+		return token;
+	}
+
+	take(token: string): string | undefined {
+		const value = this.map.get(token);
+		this.map.delete(token);
+		return value;
+	}
+}
+
+// DESIGN §16 (A42, M10): when the launch config doesn't pin a server, resolve it — silently from
+// the mssql extension's active-editor connection when available, else from a saved connection
+// profile (the Connection Manager, which now also offers a "pick from mssql" entry). A pinned
+// server/database is passed through untouched (power users / CI). The password is NEVER placed in
+// the config — the descriptor factory injects it into the adapter via env (§4/A41): from
+// SecretStorage for a saved profile, or from the ephemeral registry for an mssql connection. The
+// workspaceFolder is still injected so the adapter can resolve ${workspaceFolder}/targets.json.
 class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
-	constructor(private readonly store: ConnectionStore) {}
+	constructor(
+		private readonly store: ConnectionStore,
+		private readonly mssql: MssqlConnectionBridge,
+		private readonly secrets: EphemeralSecrets,
+	) {}
 
 	async resolveDebugConfiguration(
 		folder: vscode.WorkspaceFolder | undefined,
@@ -223,24 +256,33 @@ class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 		}
 
 		if (!config.server) {
-			const conn = await this.store.resolveForLaunch();
+			// Silent auto-use: if the active .sql editor is already connected in the mssql
+			// extension, debug against that same instance with no picker (opt out via the
+			// `tsqlDbg.mssql.useActiveEditorConnection` setting). The first ever attempt triggers
+			// mssql's own one-time approve/deny prompt; a denial just falls through below.
+			const autoUse = vscode.workspace
+				.getConfiguration('tsqlDbg')
+				.get<boolean>('mssql.useActiveEditorConnection', true);
+			let conn = autoUse ? await this.mssql.resolveActiveEditor() : undefined;
+
+			if (!conn) {
+				// Manual choice: saved profiles + a "pick from mssql" entry (when mssql is present).
+				const externalSources: ExternalSource[] = this.mssql.isAvailable()
+					? [
+							{
+								id: MSSQL_SOURCE_ID,
+								label: '$(plug) Pick from SQL Server (mssql)…',
+								detail: 'Use a connection configured in the Microsoft mssql extension',
+								resolve: () => this.mssql.pick(),
+							},
+					  ]
+					: [];
+				conn = await this.store.resolveForLaunch(externalSources);
+			}
 			if (!conn) {
 				return undefined; // cancelled — abort the launch quietly (VS Code convention)
 			}
-			config.server = conn.server;
-			if (!config.database) {
-				config.database = conn.database;
-			}
-			config.authType = conn.authType;
-			if (conn.sqlUser) {
-				config.sqlUser = conn.sqlUser;
-			}
-			config.encrypt = conn.encrypt;
-			if (conn.options) {
-				config.options = conn.options;
-			}
-			// The descriptor factory reads this to fetch the SQL password from SecretStorage.
-			config.__tsqldbgProfileId = conn.profileId;
+			this.applyResolvedConnection(config, conn);
 		}
 
 		if (!config.database) {
@@ -265,6 +307,31 @@ class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 		}
 
 		return config;
+	}
+
+	// Fold resolved launch fields into the config. The SQL password (saved-profile → SecretStorage,
+	// or mssql → inline) is routed out-of-band so it never lands in the traceable config: a saved
+	// profile leaves a profile-id ref; an mssql connection stashes the password in the ephemeral
+	// registry and leaves only a one-shot token.
+	private applyResolvedConnection(config: vscode.DebugConfiguration, conn: ResolvedConnection): void {
+		config.server = conn.server;
+		if (!config.database) {
+			config.database = conn.database;
+		}
+		config.authType = conn.authType;
+		if (conn.sqlUser) {
+			config.sqlUser = conn.sqlUser;
+		}
+		config.encrypt = conn.encrypt;
+		if (conn.options) {
+			config.options = conn.options;
+		}
+		if (conn.profileId) {
+			config.__tsqldbgProfileId = conn.profileId;
+		}
+		if (conn.password !== undefined) {
+			config.__tsqldbgSecretToken = this.secrets.put(conn.password);
+		}
 	}
 }
 
@@ -349,7 +416,11 @@ class ConnectionStatusIndicator implements vscode.Disposable {
 // from SecretStorage as a child-process env var (TSQLDBG_SQL_PASSWORD) — never a DAP launch arg,
 // never traced.
 class TsqlDebugAdapterDescriptorFactory implements vscode.DebugAdapterDescriptorFactory {
-	constructor(private readonly context: vscode.ExtensionContext, private readonly store: ConnectionStore) {}
+	constructor(
+		private readonly context: vscode.ExtensionContext,
+		private readonly store: ConnectionStore,
+		private readonly secrets: EphemeralSecrets,
+	) {}
 
 	async createDebugAdapterDescriptor(
 		session: vscode.DebugSession,
@@ -365,8 +436,17 @@ class TsqlDebugAdapterDescriptorFactory implements vscode.DebugAdapterDescriptor
 
 		const options: vscode.DebugAdapterExecutableOptions = {};
 		if (session.configuration.authType === 'sql') {
+			// Two secret sources: a saved profile (SecretStorage, keyed by id) or an mssql
+			// connection (the ephemeral registry, keyed by a one-shot token). The token wins if
+			// both are somehow present — it's the more specific, single-launch reference.
+			const token = session.configuration.__tsqldbgSecretToken;
 			const profileId = session.configuration.__tsqldbgProfileId;
-			const password = typeof profileId === 'string' ? await this.store.getPassword(profileId) : undefined;
+			let password: string | undefined;
+			if (typeof token === 'string') {
+				password = this.secrets.take(token);
+			} else if (typeof profileId === 'string') {
+				password = await this.store.getPassword(profileId);
+			}
 			if (password) {
 				// Merged with the parent environment by VS Code — adds only this one variable.
 				options.env = { TSQLDBG_SQL_PASSWORD: password };
