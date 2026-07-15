@@ -1592,14 +1592,29 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
             // evaluate call already sees the current values.
             RepublishSystemScopeIfChanged(snapshot);
 
-            // A46: a write-mode console statement may have changed variable values (SET
-            // @x = …, EXEC … @x OUTPUT, …) — drop the frame's cached Locals so the next
-            // `variables` request re-fills fresh, and emit `invalidated` so the client
-            // refetches now. Mirrors setVariable's InvalidateValues, but for the whole
-            // frame (one statement can change several variables at once).
+            // A46/A61: a write-mode console statement may have changed values behind the
+            // Variables pane — drop the stale caches so the next `variables` request re-fills
+            // fresh, and emit ONE `invalidated` so the client refetches now. A46: variable
+            // values (SET @x = …, EXEC … @x OUTPUT, …) → the frame's cached Locals (one
+            // statement can change several vars at once). A61: table contents (DELETE/INSERT/
+            // UPDATE against a @tv / #temp / real table) → the snapshot's Temp Tables display
+            // caches, whose fill-once rowcounts would otherwise stay stale until a step opens
+            // a new epoch. Coalesced into a single event so a statement that did both refetches once.
+            var invalidateVariables = false;
             if (replResult.VariablesChanged)
             {
                 snapshot.InvalidateValues(sessionFrame.Ordinal);
+                invalidateVariables = true;
+            }
+
+            if (replResult.TableContentChanged)
+            {
+                snapshot.InvalidateTempValues();
+                invalidateVariables = true;
+            }
+
+            if (invalidateVariables)
+            {
                 Protocol.SendEvent(new InvalidatedEvent
                 {
                     Areas = new List<InvalidatedAreas> { InvalidatedAreas.Variables },

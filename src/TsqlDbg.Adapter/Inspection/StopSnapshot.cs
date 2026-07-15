@@ -80,6 +80,16 @@ public sealed class StopSnapshot
     /// construction — R1/R2/R3 all embed the frame ordinal).</summary>
     public bool TryGetCachedTempValue(string physicalName, out string value) => _tempValueCache.TryGetValue(physicalName, out value!);
 
+    /// <summary>A61 (§12.3): drop every Temp Tables display value (rowcount / cursor
+    /// status) so the NEXT variables request re-reads them live. Called after a write-mode
+    /// console statement that may have changed a temp object's contents — the write
+    /// persisted to the backing object (A46) but this fill-once cache still shows the old
+    /// count. Row PAGES are always re-queried live, and the rows/detail references stay
+    /// valid (same reference space as the M6 R2 System republish, A25/A16) — so only the
+    /// cached COUNT is dropped. Still lazy: the re-read happens only if the client expands
+    /// the scope again. Broad by design (the whole cache, not a per-target drop).</summary>
+    public void InvalidateTempValues() => _tempValueCache.Clear();
+
     public void CacheTempValue(string physicalName, string value) => _tempValueCache.TryAdd(physicalName, value);
 
     /// <summary>The stable variablesReference for a table's "rows" children within

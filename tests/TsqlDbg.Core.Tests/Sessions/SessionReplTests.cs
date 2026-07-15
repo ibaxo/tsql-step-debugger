@@ -95,6 +95,7 @@ public sealed class SessionReplTests
         Assert.Contains("42", result.Rendered);
         Assert.Contains("SET XACT_ABORT OFF", executor.ReceivedBatches[^1]);   // DebuggerInitiated sandwich
         Assert.DoesNotContain("__dbg_repl_probe", executor.ReceivedBatches[^1]);
+        Assert.False(result.TableContentChanged);   // A61: a pure read refetches nothing
         await session.TeardownAsync();
     }
 
@@ -110,7 +111,47 @@ public sealed class SessionReplTests
 
         Assert.Equal(Session.ReplOutcome.Rendered, result.Outcome);
         Assert.Contains("__dbg_repl_probe", executor.ReceivedBatches[^1]);
+        Assert.True(result.TableContentChanged);   // A61: a non-variable write → the adapter refetches Temp Tables
+        Assert.False(result.VariablesChanged);      // no variable write-back for a bare table write
         Assert.False(session.IsTransactionDetached);   // probe read trancount=1 -> no edge
+        await session.TeardownAsync();
+    }
+
+    [Fact]
+    public async Task Print_SurfacesMessageStream_ToConsole()
+    {
+        // §12.3 "messages inline": PRINT text arrives on the batch's message stream
+        // (InfoMessage, fact 18) — it must render to the console, not be swallowed.
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => WithProbe(Empty(), trancount: 1, xactState: 0) with { Messages = new[] { "OK" } });
+        var session = ScriptSession("SELECT 1;", executor, allowConsoleWrites: true);
+        await session.InitializeAsync();
+        var frame = session.Frames[0];
+
+        var result = await session.EvaluateReplAsync(frame, "PRINT 'OK';");
+
+        Assert.Equal(Session.ReplOutcome.Rendered, result.Outcome);
+        Assert.Contains("OK", result.Rendered);
+        Assert.DoesNotContain("no result sets", result.Rendered);
+        await session.TeardownAsync();
+    }
+
+    [Fact]
+    public async Task NoOutput_RendersEmpty_NotNoResultSetsFiller()
+    {
+        // A write with no result set and no message stream (NOCOUNT forced, C5) renders
+        // as empty — the old "(no result sets)" filler is gone; the effect surfaces via
+        // the Variables / Temp Tables refresh instead.
+        var executor = Init(new FakeStatementExecutor())
+            .Then(_ => WithProbe(Empty(), trancount: 1, xactState: 0));
+        var session = ScriptSession("SELECT 1;", executor, allowConsoleWrites: true);
+        await session.InitializeAsync();
+        var frame = session.Frames[0];
+
+        var result = await session.EvaluateReplAsync(frame, "INSERT INTO dbo.T (a) VALUES (1);");
+
+        Assert.Equal(Session.ReplOutcome.Rendered, result.Outcome);
+        Assert.Equal(string.Empty, result.Rendered);
         await session.TeardownAsync();
     }
 
@@ -259,7 +300,28 @@ public sealed class SessionReplTests
         Assert.Contains("UPDATE #__dbg_s0 SET", lastBatch);       // A46: write-back to the state table
         Assert.Contains("__dbg_state", lastBatch);                // A46: snapshot read-back
         Assert.True(result.VariablesChanged);                     // session refreshed from the read-back
+        Assert.False(result.TableContentChanged);                 // A61: a variable-only SET touches no table
         Assert.Equal(99, Convert.ToInt32(frame.Snapshot![0]));    // Frame.Snapshot now holds the new value
+        await session.TeardownAsync();
+    }
+
+    // A61 (the reported scenario): a `DELETE TOP(1) FROM @tv` in the console changes the
+    // table variable's contents (persisted to the real backing object, A46) but writes no
+    // scalar variable — so it must flag TableContentChanged (adapter drops the Temp Tables
+    // rowcount cache and refetches) WITHOUT flagging VariablesChanged.
+    [Fact]
+    public async Task WriteMode_TableVariableDelete_SetsTableContentChanged_NotVariablesChanged()
+    {
+        var executor = Init(new FakeStatementExecutor()).Then(_ => WithProbe(Empty(), trancount: 1, xactState: 0));
+        var session = ScriptSession("SELECT 1;", executor, allowConsoleWrites: true);
+        await session.InitializeAsync();
+        var frame = session.Frames[0];
+
+        var result = await session.EvaluateReplAsync(frame, "DELETE TOP(1) FROM @tv;");
+
+        Assert.Equal(Session.ReplOutcome.Rendered, result.Outcome);
+        Assert.True(result.TableContentChanged);
+        Assert.False(result.VariablesChanged);
         await session.TeardownAsync();
     }
 

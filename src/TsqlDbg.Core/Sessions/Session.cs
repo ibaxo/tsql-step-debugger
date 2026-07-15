@@ -949,8 +949,13 @@ public sealed class Session
     /// (whitelist/parse/state-matrix) — the caller surfaces this as a DAP error.</summary>
     // A46: VariablesChanged is true when a write-mode console statement wrote variable
     // state back (the adapter then invalidates the frame's Locals cache so the Variables
-    // panel refetches). Optional/defaulted so the Refused/read paths construct unchanged.
-    public sealed record ReplResult(ReplOutcome Outcome, string? Rendered, string? RefusalMessage, bool VariablesChanged = false);
+    // panel refetches). A61: TableContentChanged is its table-content analog — true when
+    // the statement was a non-variable-only write (DELETE/INSERT/UPDATE/MERGE against a
+    // table var / #temp / real table), so the adapter drops the Temp Tables display caches
+    // and refetches the live rowcount. Both optional/defaulted so the Refused/read paths
+    // construct unchanged.
+    public sealed record ReplResult(ReplOutcome Outcome, string? Rendered, string? RefusalMessage,
+        bool VariablesChanged = false, bool TableContentChanged = false);
 
     // §12.3 pipeline: parse (selected frame's parser) -> whitelist -> R1-R7 rewrite
     // against that frame -> own micro TRY/CATCH, DebuggerInitiated -> no shadow
@@ -1098,6 +1103,15 @@ public sealed class Session
 
         var (userSets, fault, probe, stateValues) = ParseReplBatchResult(batchResult);
 
+        // §12.3 "messages inline": surface the batch's own PRINT / low-severity RAISERROR
+        // (sev ≤ 10 arrives as an InfoMessage, fact 18) output to the console. This stream
+        // was previously dropped — a bare `PRINT 'OK'` rendered as "(no result sets)" with
+        // the message swallowed. The oracle's TRY/CATCH swallows sev > 10 server-side (it is
+        // reported via the __dbg_repl_err row below), so these are the user's info-stream
+        // messages only, never a doubled fault. Ordered after any debugger meta-note (the
+        // §10.4 resurrection line) but before the fault line, matching execution order.
+        messages.AddRange(batchResult.Messages);
+
         // A46: a write-mode statement's __dbg_state read-back refreshes the SELECTED
         // frame's binary snapshot (§8.1) — the same refresh the interpreter does every
         // step (RunFaultableBatchAsync). On a caught fault the batch emits no __dbg_state,
@@ -1131,7 +1145,15 @@ public sealed class Session
                 (f.Line is { } line ? $", Line {line}" : string.Empty) + $"\n{f.Message}");
         }
 
-        return new ReplResult(ReplOutcome.Rendered, RenderReplOutput(userSets, messages, _options.MaxConsoleRows), null, variablesChanged);
+        // A61: a write that touched table contents (any allowed write that is not a
+        // variable-only `SET @x = …`) may have changed a temp/table-var/#temp rowcount.
+        // Reaching here means classification allowed it, so allowConsoleWrites is on. Broad
+        // by design — a real-table write sets it too; the adapter's re-read is lazy, so an
+        // over-eager flag costs nothing (mirrors "a step re-reads everything").
+        var tableContentChanged = classification.IsWrite && !classification.IsVariableOnlyWrite;
+
+        return new ReplResult(ReplOutcome.Rendered, RenderReplOutput(userSets, messages, _options.MaxConsoleRows),
+            null, variablesChanged, tableContentChanged);
     }
 
     private static (IReadOnlyList<ResultSet> UserSets,
@@ -1204,8 +1226,12 @@ public sealed class Session
             sb.AppendLine(tables);
         }
 
-        var rendered = sb.ToString().TrimEnd('\r', '\n');
-        return rendered.Length == 0 ? "(no result sets)" : rendered;
+        // §12.3: a statement with no result sets and no message stream (a write under
+        // forced NOCOUNT, C5; an empty/side-effect-only statement) renders as empty — the
+        // console echoes the input and adds no noise. The old "(no result sets)" filler was
+        // misleading for PRINT/SET/writes: the effect surfaces via the Variables / Temp
+        // Tables refresh, not a console line.
+        return sb.ToString().TrimEnd('\r', '\n');
     }
 
     /// <summary>
