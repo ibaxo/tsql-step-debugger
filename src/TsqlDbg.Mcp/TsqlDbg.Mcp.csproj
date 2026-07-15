@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- DESIGN §24 (M11): programmatic surface. A third stdio host alongside the DAP
+       adapter and the fidelity harness. References Core ONLY — never TsqlDbg.Adapter,
+       which would drag in the DAP/VS Code stack (§24.0). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>tsqldbg-mcp</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Official C# MCP SDK (maintained with Microsoft), verified on NuGet 2026-07-15
+         per CLAUDE.md rule 5. ModelContextProtocol brings the hosting/DI extensions;
+         Microsoft.Extensions.Hosting supplies Host.CreateApplicationBuilder. -->
+    <PackageReference Include="ModelContextProtocol" Version="1.4.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TsqlDbg.Core\TsqlDbg.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The test project drives McpDebugSession via its internal Session-based seam (§24.11
+         fake-IStatementExecutor driver tests). -->
+    <InternalsVisibleTo Include="TsqlDbg.Mcp.Tests" />
+  </ItemGroup>
+
+</Project>
