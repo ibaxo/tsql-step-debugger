@@ -1,26 +1,32 @@
 # T-SQL Step Debugger
 
-A **client-side** step debugger for T-SQL. Set a breakpoint, step through a script or a
-stored procedure — watching variables, temp tables, and the call stack — against a real
-SQL Server. No engine-side debug support required (no SSDT, no `sysadmin`).
+[![Report Bug](https://img.shields.io/badge/Report%20Bug-red?logo=github)](https://github.com/ibaxo/tsql-step-debugger/issues/new?labels=bug)
+[![Request Feature](https://img.shields.io/badge/Request%20Feature-blue?logo=github)](https://github.com/ibaxo/tsql-step-debugger/issues/new?labels=enhancement)
 
-Everything runs on the client inside a transaction that **rolls back by default**, so you
-can step through real logic on a dev/test database without leaving anything behind.
+> Set a breakpoint in a `.sql` file, press **F5**, and step through T-SQL like real code —
+> watching variables, temp tables, and the call stack live against a real SQL Server.
+
+![T-SQL Step Debugger in action](https://raw.githubusercontent.com/ibaxo/tsql-step-debugger/main/extension/images/intro.gif)
+
+A **client-side** step debugger for T-SQL stored procedures, functions, and scripts. No
+engine-side debug support required — **no SSDT, no `sysadmin`**, nothing to install on the
+server. Everything runs on the client inside a transaction that **rolls back by default**, so
+you can step through real logic on a dev/test database without leaving anything behind.
 
 It comes in two surfaces over the same debugger core:
 
 | Surface | For | How you drive it |
 |---|---|---|
-| **VS Code extension** | a human, in the editor | breakpoints + F5; the Debug Adapter (DAP) host |
-| **MCP server** | an AI agent (e.g. Claude Code) | tool calls over MCP; the programmatic host |
+| **[VS Code extension](#debug-t-sql-in-vs-code)** | a human, in the editor | breakpoints + F5; the Debug Adapter (DAP) host |
+| **[MCP server](#use-it-from-an-ai-agent-mcp-server)** | an AI agent (e.g. Claude Code) | tool calls over MCP; the programmatic host |
 
-- Targets **SQL Server 2016+**. The interactive adapter ships self-contained for **Windows (x64)**.
-- The full design is in [`docs/DESIGN.md`](docs/DESIGN.md); a developer reference is in
-  [`docs/README.md`](docs/README.md).
+Targets **SQL Server 2016+**; the interactive adapter ships self-contained for **Windows (x64)**.
+The full design is in [`docs/DESIGN.md`](docs/DESIGN.md); a developer reference is in
+[`docs/README.md`](docs/README.md).
 
 ---
 
-# Using it in VS Code
+# Debug T-SQL in VS Code
 
 Set a breakpoint in a `.sql` file, press **F5**, and step.
 
@@ -29,24 +35,75 @@ Set a breakpoint in a `.sql` file, press **F5**, and step.
 1. **Add a connection.** Click the **`$(database)` T-SQL** item in the status bar (or run
    **T-SQL Debug: Manage Connections**) and add a server + database — **Windows (integrated)**
    auth, or a **SQL login** (its password is kept in VS Code SecretStorage, never in a file).
+   *Already using Microsoft's [SQL Server (mssql)](https://marketplace.visualstudio.com/items?itemName=ms-mssql.mssql)
+   extension? You can [reuse its connections](#reusing-your-mssql-connections) instead.*
 2. **Open a `.sql` file and debug it.** Click **▷ Debug T-SQL Script** in the editor title
    bar, or press **F5**. No `launch.json` needed — you'll pick your connection the first time.
 3. **Set breakpoints** in the gutter and step from there.
 
-## While you're stopped
+The file **doesn't even have to be saved**: open a fresh untitled buffer, type some T-SQL, and
+press F5 — the exact text on screen is debugged in place, nothing is written to disk.
 
-- **Step** — Over (`F10`), Into a called proc (`F11`), Out (`Shift+F11`), Continue (`F5`).
-- **Call stack**, and a **Variables** panel: **Locals**, **Temp Tables** (browse `#temp` /
-  `@table` contents), and **System** (`@@TRANCOUNT`, `XACT_STATE()`, `@@SPID`).
-- **Watch** and **hover**; **Set Value** to edit a local.
-- **User-defined types** — alias types (`CREATE TYPE dbo.Name FROM nvarchar(50)`) and table
-  types (`DECLARE @t dbo.OrderRows`) step like any other variable; a table-type variable
-  shows up under **Temp Tables**, and passing one as a table-valued parameter to a procedure
-  works (that call is stepped over, not into).
-- **Debug Console** (`Ctrl+Shift+Y`) — a live T-SQL REPL against the current frame, so
-  `SELECT @x` and `SELECT * FROM #work` just work. Writable by default.
-- **Breakpoints** — conditional, hit-count, and **logpoints**; toggle **Caught / Unhandled**
-  error breaks; **Jump to Cursor** to move execution.
+## Features
+
+### Stepping & inspection
+
+| Capability | What it does |
+|---|---|
+| **Step through T-SQL** | Step Over, Into, Out, and Continue — statement by statement, against a real SQL Server. |
+| **Step into called code** | Follow execution into called stored procedures, scalar functions, and **dynamic SQL** (`sp_executesql`, `EXEC(@sql)`). |
+| **Call stack** | The full frame stack; select any frame to inspect its own locals. |
+| **Variables** | **Locals**, a **Temp Tables** scope to browse `#temp` / `@table` contents, and a **System** scope (`@@TRANCOUNT`, `XACT_STATE()`, `@@SPID`, SET options). |
+| **Watch, hover & edit** | Watch expressions, hover-to-evaluate, and **Set Value** to change a local mid-run. |
+| **Debug Console (REPL)** | A live T-SQL prompt against the current frame — `SELECT @x` and `SELECT * FROM #work` just work. Writable by default. |
+| **User-defined types** | Alias types and table types step like any other variable; table-valued parameters pass through to called procedures. |
+
+### Breakpoints & flow control
+
+| Capability | What it does |
+|---|---|
+| **Breakpoints** | Line, **conditional**, and **hit-count** breakpoints. |
+| **Logpoints** | Log a message (with `{expressions}`) without stopping. |
+| **Error breaks** | Toggle **Caught** / **Unhandled** to break when T-SQL raises an error. |
+| **Jump to Cursor** | Move the execution point to another statement. |
+| **Run to Cursor** | Run ahead to a line — including into a later `GO` batch. |
+
+### Connections & safety
+
+| Capability | What it does |
+|---|---|
+| **No `launch.json` needed** | Script mode is the default; F5 (or ▷) on any `.sql` just works. |
+| **Debug unsaved buffers** | The live editor text is debugged verbatim — no save, no temp file. |
+| **Connection Manager** | Saved profiles, integrated or SQL-login auth; SQL passwords live in VS Code SecretStorage, never in `launch.json`. |
+| **Reuse mssql connections** | Borrow a connection from the [SQL Server (mssql)](https://marketplace.visualstudio.com/items?itemName=ms-mssql.mssql) extension — see below. |
+| **Rolls back by default** | The whole session runs in one transaction that rolls back when it ends. Nothing persists unless you explicitly opt in. |
+
+## Keyboard shortcuts
+
+| Action | Shortcut |
+|---|---|
+| Start / Continue | `F5` |
+| Step Over | `F10` |
+| Step Into | `F11` |
+| Step Out | `Shift+F11` |
+| Stop | `Shift+F5` |
+| Toggle Breakpoint | `F9` |
+| Open Debug Console | `Ctrl+Shift+Y` |
+
+## Reusing your mssql connections
+
+If you already have Microsoft's **[SQL Server (mssql)](https://marketplace.visualstudio.com/items?itemName=ms-mssql.mssql)**
+extension installed with connections configured, you don't have to re-enter them:
+
+- **Automatic** — open a `.sql` file that mssql is connected to and press F5; the debug session
+  uses **that same connection**, no picker. (The first time, mssql asks you to approve sharing;
+  that consent is remembered.)
+- **On demand** — when you're not on a connected file, the connection chooser includes a
+  **“$(plug) Pick from SQL Server (mssql)…”** entry alongside your own saved profiles.
+
+Prefer to always use the T-SQL Debugger's own Connection Manager? Set
+`tsqlDbg.mssql.useActiveEditorConnection` to `false`. *(Azure AD / access-token connections
+aren't supported yet — pick a Windows or SQL-login connection.)*
 
 ## Safety
 
@@ -56,15 +113,15 @@ Set a breakpoint in a `.sql` file, press **F5**, and step.
 - **Dev/test servers only** — while paused, the session holds its transaction locks open.
   The active server/database shows in the status bar the whole time.
 
-## Debugging a T-SQL script
+## Debugging a script
 
 The **▷ Debug T-SQL Script** button and **F5** both debug the active `.sql` file with no
-`launch.json` at all — script mode is the default. The file **doesn't have to be saved**: open a
-new untitled buffer (or one with unsaved edits), type your T-SQL, and press F5 — the exact text
-on screen is debugged in place, nothing is written to disk, and breakpoints and the step arrow
-land in that same editor. Add a `launch.json` entry when you want to
-tweak an option; *Run and Debug → create a launch.json file* generates exactly this, which
-behaves identically to the button, with **every option at its default**:
+`launch.json` at all — script mode is the default, and the file doesn't have to be saved. Add a
+`launch.json` entry only when you want to tweak an option; *Run and Debug → create a launch.json
+file* generates exactly this, which behaves identically to the button.
+
+<details>
+<summary>Full <code>launch.json</code> for script mode (every option at its default)</summary>
 
 ```json
 {
@@ -91,19 +148,21 @@ behaves identically to the button, with **every option at its default**:
   "trace": false
 }
 ```
+</details>
 
 The connection is deliberately absent: with no `server` in the config you pick a saved
 connection from the **Connection Manager** at launch, which is where server, database, auth
 type and login belong. You *can* pin `server`/`database`/`authType`/`sqlUser`/`encrypt`/
 `options` here (CI, or a config you never want to prompt), but there is no `password` field by
-design — SQL passwords live in VS Code SecretStorage, never in `launch.json`. Every option is
-described in the [Configuration reference](#configuration-reference).
+design — SQL passwords live in VS Code SecretStorage, never in `launch.json`.
 
 ## Debugging a stored procedure
 
 To debug a **deployed procedure** instead of a script, add a `launch.json` entry with
-`mode: "procedure"` — shown here with **every option at its default** (`procedure` and `args`
-are the procedure-mode fields that replace `script`):
+`mode: "procedure"` (`procedure` and `args` are the procedure-mode fields that replace `script`):
+
+<details>
+<summary>Full <code>launch.json</code> for procedure mode (every option at its default)</summary>
 
 ```json
 {
@@ -131,6 +190,7 @@ are the procedure-mode fields that replace `script`):
   "trace": false
 }
 ```
+</details>
 
 `procedure` is a two/three-part name (required); `args` maps each parameter to a **T-SQL
 literal** — note `N'…'` for Unicode — and defaults to `{}`. **Every parameter the procedure
@@ -141,6 +201,9 @@ Connection Manager here too.
 
 Everything goes in a `launch.json` entry (`"type": "tsql"`). Only `mode` (and `procedure`
 for procedure mode) really matters; the rest have sensible defaults.
+
+<details>
+<summary>All launch options</summary>
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -171,11 +234,18 @@ for procedure mode) really matters; the rest have sensible defaults.
 | `watchBudgetMs` | number | `2000` | Per-stop budget for evaluating Watch expressions. |
 | `trace` | boolean | `false` | Write a full adapter log (for diagnosing the debugger itself). |
 
-**Using a locally-built adapter:** set `tsqlDbg.adapterPath` to your own `TsqlDbg.Adapter` build.
+</details>
+
+**Extension settings** (VS Code *Settings*, `tsqlDbg.*`):
+
+| Setting | Default | Description |
+|---|---|---|
+| `tsqlDbg.mssql.useActiveEditorConnection` | `true` | Auto-use the active `.sql` file's mssql connection when set. |
+| `tsqlDbg.adapterPath` | — | Dev override: absolute path to a locally-built `TsqlDbg.Adapter`. |
 
 ---
 
-# Using it from an AI agent (MCP server)
+# Use it from an AI agent (MCP server)
 
 `TsqlDbg.Mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that
 exposes the same debugger to an AI agent — so an assistant like Claude Code can debug a
@@ -267,27 +337,6 @@ For SQL-auth targets, also set `TSQLDBG_SQL_PASSWORD` in `env` (never as a tool 
 
 ---
 
-# Project structure
-
-```
-tsql-step-debugger/
-├── extension/                # VS Code extension shell (TypeScript, esbuild) — DAP client
-├── src/
-│   ├── TsqlDbg.Core/         # interpreter, rewriter, state, error model — NO DAP/VS Code deps
-│   ├── TsqlDbg.Adapter/      # DAP host (stdio) — the interactive surface (VS Code)
-│   └── TsqlDbg.Mcp/          # MCP host (stdio) — the programmatic surface (AI agents)
-├── tests/
-│   ├── TsqlDbg.Core.Tests/       # unit: rewriter, interpreter (fake IStatementExecutor)
-│   ├── TsqlDbg.Adapter.Tests/    # unit: DAP host
-│   ├── TsqlDbg.Mcp.Tests/        # unit: MCP host + driver tests
-│   └── TsqlDbg.Integration/      # integration + fidelity harness (needs a live SQL Server)
-└── docs/                     # DESIGN.md (the spec), README.md (developer reference), engine-facts.md
-```
-
-`TsqlDbg.Core` holds all the debugging logic and has **no** DAP or VS Code dependency; the
-adapter and the MCP server are two thin hosts over it (see [`docs/DESIGN.md`](docs/DESIGN.md)
-§3 and §24).
-
 # Building from source
 
 **Prerequisites:** .NET 8 SDK; Node 18+ (for the extension); a reachable SQL Server for the
@@ -312,7 +361,34 @@ dotnet publish src/TsqlDbg.Mcp     -c Release -r win-x64 --self-contained
 
 # Build the VS Code extension
 cd extension && npm ci && npm run build
+
+# Package the platform-specific VSIX
+npx @vscode/vsce package --target win32-x64
 ```
+
+<details>
+<summary>Project layout</summary>
+
+```
+tsql-step-debugger/
+├── extension/                # VS Code extension shell (TypeScript, esbuild) — DAP client
+├── src/
+│   ├── TsqlDbg.Core/         # interpreter, rewriter, state, error model — NO DAP/VS Code deps
+│   ├── TsqlDbg.Adapter/      # DAP host (stdio) — the interactive surface (VS Code)
+│   └── TsqlDbg.Mcp/          # MCP host (stdio) — the programmatic surface (AI agents)
+├── tests/
+│   ├── TsqlDbg.Core.Tests/       # unit: rewriter, interpreter (fake IStatementExecutor)
+│   ├── TsqlDbg.Adapter.Tests/    # unit: DAP host
+│   ├── TsqlDbg.Mcp.Tests/        # unit: MCP host + driver tests
+│   └── TsqlDbg.Integration/      # integration + fidelity harness (needs a live SQL Server)
+└── docs/                     # DESIGN.md (the spec), README.md (developer reference), engine-facts.md
+```
+
+`TsqlDbg.Core` holds all the debugging logic and has **no** DAP or VS Code dependency; the
+adapter and the MCP server are two thin hosts over it (see [`docs/DESIGN.md`](docs/DESIGN.md)
+§3 and §24).
+
+</details>
 
 # Requirements
 
@@ -321,3 +397,20 @@ cd extension && npm ci && npm run build
 - **MCP server / building from source:** .NET 8 runtime (or SDK to build); any OS the .NET
   runtime supports.
 - Debugging needs only ordinary `EXECUTE`/`SELECT` + `VIEW DEFINITION` — **no `sysadmin`**.
+
+---
+
+# Support & feedback
+
+Found a bug or have a feature request? Please open an issue on
+[GitHub](https://github.com/ibaxo/tsql-step-debugger/issues). This extension is in **preview** —
+feedback is very welcome.
+
+# Telemetry
+
+This extension collects **no telemetry** and sends **no data** anywhere. It talks only to the
+SQL Server you point it at.
+
+# License
+
+[MIT](https://github.com/ibaxo/tsql-step-debugger/blob/main/LICENSE) © ibaxo.
