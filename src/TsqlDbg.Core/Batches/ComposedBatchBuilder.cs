@@ -160,6 +160,56 @@ public static class ComposedBatchBuilder
             composition ?? BatchComposition.Default, CollectTvpArguments(unit.Fragment, frame));
     }
 
+    // DESIGN §9 (A63): a cursor-variable assignment `SET @c = CURSOR <def>` cannot be span-patched
+    // in place — its leading `SET @c = CURSOR` is keyword/operator tokens, not AST fragments, so
+    // §7.4 invariant 1 forbids a raw-offset patch. It is composed like BuildSyntheticAssignment /
+    // BuildForPredicate: a GENERATED shell around a rewritten sub-fragment (the CursorDefinition,
+    // whose LOCAL/GLOBAL option R3 stripped and whose SELECT body R1/R2 patched). The variable is
+    // reified as a frame-unique GLOBAL cursor so its FETCH position survives the debugger's per-SU
+    // batches (the same trick R3 plays for named cursors); the CURSOR_STATUS guard makes a re-SET
+    // of the same variable faithful (native dereferences the old cursor and creates a new one).
+    public static ComposedBatch BuildForCursorVariableAssign(
+        Frame frame, RewriteEngine rewriteEngine, RewriteContext rewriteContext,
+        StatementUnit unit, string fullScript, ShadowValues shadowValues,
+        BatchComposition? composition = null)
+    {
+        var set = (SetVariableStatement)unit.Fragment;
+        var cursorDefinition = set.CursorDefinition
+            ?? throw new InvalidOperationException("BuildForCursorVariableAssign requires a SET @c = CURSOR … statement.");
+        var variableName = set.Variable?.Name
+            ?? throw new InvalidOperationException("A cursor-variable assignment without a target variable.");
+
+        var physical = RewriteContext.CursorVariablePhysicalName(variableName, frame.Ordinal);
+        var bracket = RewriteContext.BracketIdentifier(physical);
+        var statusLiteral = physical.Replace("'", "''");               // N'…' literal for CURSOR_STATUS
+
+        // Reconstruct `<options> FOR <select>` deterministically rather than slicing the whole
+        // CursorDefinition: ScriptDom's CursorDefinition span INCLUDES the `FOR` keyword when
+        // options precede it but EXCLUDES it (span starts at SELECT) when there are none, so a
+        // single slice would drop `FOR` in the no-option case. GLOBAL is always synthesized here
+        // (it is what persists the cursor across the debugger's per-SU batches); the source
+        // LOCAL/GLOBAL option is dropped, every other option (SCROLL/STATIC/READ_ONLY/…) is kept
+        // byte-exact, and the SELECT body is rewritten so its #temp/@t refs resolve (R1/R2).
+        var optionParts = new List<string>();
+        foreach (var option in cursorDefinition.Options)
+        {
+            if (option.OptionKind is CursorOptionKind.Local or CursorOptionKind.Global)
+                continue;
+            optionParts.Add(fullScript.Substring(option.StartOffset, option.FragmentLength));
+        }
+        var optionsText = optionParts.Count > 0 ? string.Join(" ", optionParts) + " " : string.Empty;
+
+        var select = cursorDefinition.Select
+            ?? throw new InvalidOperationException("A cursor definition without a SELECT body.");
+        var rewrite = rewriteEngine.Rewrite(select, fullScript, rewriteContext);
+
+        var declare =
+            $"IF CURSOR_STATUS('global', N'{statusLiteral}') >= -1 DEALLOCATE {bracket}; " +
+            $"DECLARE {bracket} CURSOR GLOBAL {optionsText}FOR {rewrite.PatchedText};";
+        return Build(frame, rewriteContext, declare, rewrite.RequiredShadows, shadowValues,
+            composition ?? BatchComposition.Default, CollectTvpArguments(select, frame));
+    }
+
     /// <summary>
     /// DESIGN §9 (A59): the frame's table-type variables this fragment references as a scalar
     /// <c>VariableReference</c> — i.e. passes as a TVP ARGUMENT. Not only `EXEC p @rows = @t`:
@@ -713,6 +763,16 @@ public static class ComposedBatchBuilder
         }
 
         Line("DECLARE " + string.Join(", ", declareParts) + ";");
+
+        // A63 (F1, §9): declare the frame's cursor VARIABLES as real (unallocated) cursor
+        // variables. A reified reference rewrites @c to its GLOBAL name and never touches this
+        // declaration; but an OPEN/FETCH/CLOSE/DEALLOCATE of a cursor variable that was DECLARE'd
+        // and never SET must fault as native does (error 16950, statement-level, catchable via the
+        // §7.1 oracle), not with a bogus 137 "must declare @c" because @c was absent from the batch.
+        foreach (var cursorVariable in frame.CursorVariables)
+        {
+            Line($"DECLARE {cursorVariable} CURSOR;");
+        }
 
         List<BatchParameter>? parameters = null;
         if (variables.Count > 0)

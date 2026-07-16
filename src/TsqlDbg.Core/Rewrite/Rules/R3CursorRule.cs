@@ -1,6 +1,13 @@
 // DESIGN §7.4 rule R3 — cursors become connection-global with frame-unique names (§9):
 //   DECLARE c CURSOR [LOCAL] …  →  DECLARE [c__f{n}_c] CURSOR GLOBAL …
 //   OPEN/FETCH/CLOSE/DEALLOCATE c and WHERE CURRENT OF c  →  patched via CursorId.
+// A63: cursor VARIABLES (DECLARE @c CURSOR) ride the same model — a CursorId whose Name is a
+// VariableReference (not an Identifier) is resolved here to the reified GLOBAL cursor registered
+// at the `SET @c = CURSOR FOR` site (§9). That SET itself is NOT rewritten by R3 — its `SET…CURSOR`
+// keywords are not AST fragments, so §7.4 invariant 1 forbids a span patch — the interpreter
+// composes a generated `DECLARE [phys] CURSOR GLOBAL <options> FOR <select>` batch instead
+// (ComposedBatchBuilder.BuildForCursorVariableAssign), which reconstructs the options + FOR and
+// rewrites only the SELECT body (its #temp/@t refs) through the normal R1/R2 pipeline.
 // A LOCAL cursor declared inside one of our composed batches would die at that batch's
 // end — GLOBAL is what makes the per-SU model work; frame-unique names keep recursion
 // safe (§11.4). When the DECLARE carries neither LOCAL nor GLOBAL the database's
@@ -58,15 +65,22 @@ public sealed class R3CursorRule : IRewriteRule
 
         public override void Visit(CursorId node)
         {
-            // Cursor VARIABLES (DECLARE @c CURSOR) are refused at validation (C12), so
-            // a CursorId here always carries a plain identifier name.
-            var identifier = node.Name?.Identifier;
-            if (identifier is null || string.IsNullOrEmpty(identifier.Value))
-                return;
-
-            var physical = _scope.ResolveReference(identifier.Value, TempObjectKind.Cursor);
-            if (physical is not null)
-                _patches.Add(identifier, RewriteContext.BracketIdentifier(physical));
+            // A named cursor's CursorId carries a plain Identifier; a cursor VARIABLE's (A63)
+            // carries a VariableReference in Name.ValueExpression instead. Both resolve through
+            // the same §9 registry — the named cursor by its source name, the variable by its
+            // '@'-prefixed name (registered at the SET site with the same key).
+            if (node.Name?.Identifier is { Value: { Length: > 0 } } identifier)
+            {
+                var physical = _scope.ResolveReference(identifier.Value, TempObjectKind.Cursor);
+                if (physical is not null)
+                    _patches.Add(identifier, RewriteContext.BracketIdentifier(physical));
+            }
+            else if (node.Name?.ValueExpression is VariableReference { Name: { Length: > 0 } variableName } variableRef)
+            {
+                var physical = _scope.ResolveReference(variableName, TempObjectKind.Cursor);
+                if (physical is not null)
+                    _patches.Add(variableRef, RewriteContext.BracketIdentifier(physical));
+            }
         }
     }
 }

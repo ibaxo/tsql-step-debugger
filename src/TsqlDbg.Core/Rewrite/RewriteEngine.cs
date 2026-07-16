@@ -89,6 +89,14 @@ public sealed record RewriteContext
     public static string CursorPhysicalName(string originalName, int frameOrdinal)
         => $"{originalName}__f{frameOrdinal}_c";                     // "cur" → "cur__f2_c" (R3)
 
+    // A63 (§9): a cursor VARIABLE (DECLARE @c CURSOR) is reified as a frame-unique GLOBAL
+    // cursor created at its `SET @c = CURSOR FOR …` site, so the FETCH position persists
+    // across the debugger's per-SU batches exactly like a named cursor. The leading '@' is
+    // stripped (a name starting with '@' would re-parse as a variable) and the `_cv` suffix
+    // keeps it distinct from a same-named named cursor's `_c` (both frame-scoped by ordinal).
+    public static string CursorVariablePhysicalName(string variableName, int frameOrdinal)
+        => $"{variableName.TrimStart('@')}__f{frameOrdinal}_cv";     // "@c" → "c__f2_cv" (R3)
+
     /// <summary>Bracket-quotes an identifier for splicing into patched SQL (]]-escape).</summary>
     public static string BracketIdentifier(string rawName)
         => "[" + rawName.Replace("]", "]]") + "]";

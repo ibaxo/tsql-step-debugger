@@ -25,8 +25,10 @@ public enum FrameKind { Procedure, Script }
 public sealed record ParseTimeDiagnostic(int Line, string Message);
 
 /// <summary>
-/// Thrown at cursor creation (session launch), before milestone gating — natively this
-/// code could never start executing, which outranks "the debugger doesn't support X yet".
+/// Thrown at cursor creation (session launch), before milestone gating. Most diagnostics are
+/// genuine T-SQL compile errors (natively this code could never start executing, which outranks
+/// "the debugger doesn't support X yet"); a few (A63 cursor-variable aliasing / OUTPUT params) are
+/// debugger limitations reported the same way — the banner wording covers both.
 /// </summary>
 public sealed class ParseTimeDiagnosticException : Exception
 {
@@ -39,7 +41,7 @@ public sealed class ParseTimeDiagnosticException : Exception
     {
         var lines = new List<string>
         {
-            $"This code fails T-SQL compile-time validation ({diagnostics.Count} error(s) — the engine would refuse the batch before executing anything):",
+            $"This code cannot be launched for debugging ({diagnostics.Count} problem(s) — a T-SQL compile error the engine would refuse, or a construct the debugger cannot model):",
         };
         foreach (var d in diagnostics)
             lines.Add($"  line {d.Line}: {d.Message}");
@@ -139,7 +141,8 @@ public sealed class ControlFlowMap
     /// WHILE (135/136), GOTO into a TRY/CATCH scope (1026), RETURN-with-value in a
     /// script frame (178), bare THROW outside a CATCH block (10704 — M3, verified
     /// compile-time + lexical), variable use before its declaration point (137, with
-    /// declaration hoisting per fact 14), cursor variables (caveat C12).
+    /// declaration hoisting per fact 14), and cursor-variable aliasing (A63 — a cursor variable
+    /// assigned from another cursor, the one cursor-variable shape still unsupported; C12).
     /// </summary>
     internal static ControlFlowMap BuildAndValidate(
         IList<TSqlStatement> body, FrameKind frameKind, IEnumerable<string> preDeclaredVariables)
@@ -148,6 +151,11 @@ public sealed class ControlFlowMap
         var paths = new Dictionary<TSqlStatement, IReadOnlyList<PathStep>>(ReferenceEqualityComparer.Instance);
         var gotos = new List<(GoToStatement Statement, IReadOnlyList<PathStep> Path)>();
         var diagnostics = new List<ParseTimeDiagnostic>();
+        // A63: cursor variables are supported (reified as GLOBAL cursors, §9). Track their names so
+        // the ONE unsupported shape — assigning a cursor variable from ANOTHER cursor
+        // (`SET @c = @d` / `SET @c = named`, which parses as a scalar assignment, not a
+        // CursorDefinition) — is refused with an honest message rather than a runtime error 137.
+        var cursorVariables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Variable-visibility model (fact 14): declarations are hoisted at compile time,
         // visible from the END of their whole DECLARE statement (probe G: sibling
@@ -213,14 +221,44 @@ public sealed class ControlFlowMap
                         var declarationPoint = declare.StartOffset + declare.FragmentLength;
                         foreach (var element in declare.Declarations)
                         {
-                            if (element.DataType is SqlDataTypeReference { SqlDataTypeOption: SqlDataTypeOption.Cursor })
-                                diagnostics.Add(new(s.StartLine,
-                                    $"Cursor variables (DECLARE {element.VariableName?.Value} CURSOR) are not " +
-                                    "supported by the debugger (caveat C12)."));
                             var name = NormalizeVariable(element.VariableName?.Value);
+                            // A63: cursor variables are reified as GLOBAL cursors (§9), not scalar state.
+                            // Record the name so a later cursor-aliasing SET can be refused; still add it
+                            // to visibleFrom (a use before its DECLARE is engine error 137 either way).
+                            if (element.DataType is SqlDataTypeReference { SqlDataTypeOption: SqlDataTypeOption.Cursor }
+                                && name.Length > 0)
+                                cursorVariables.Add(name);
                             if (name.Length > 0 && !visibleFrom.ContainsKey(name))
                                 visibleFrom[name] = declarationPoint;
                         }
+                        break;
+
+                    // A63: `SET @c = <cursor>` (aliasing an existing cursor into a cursor variable)
+                    // parses as a scalar SetVariableStatement with an Expression, not a CursorDefinition.
+                    // The debugger reifies a cursor variable only at its `SET @c = CURSOR FOR …` creation
+                    // site; aliasing (which would need to share one physical cursor between two variables)
+                    // is unsupported — refuse it up front rather than fault at runtime.
+                    case SetVariableStatement { CursorDefinition: null, Expression: not null, Variable.Name: { } setTarget }
+                            when cursorVariables.Contains(NormalizeVariable(setTarget)):
+                        diagnostics.Add(new(s.StartLine,
+                            $"Assigning a cursor variable ({setTarget}) from another cursor is not supported " +
+                            "by the debugger (caveat C12). Declare and open the cursor directly with " +
+                            $"SET {setTarget} = CURSOR FOR …."));
+                        break;
+
+                    // A63 (F4): passing a cursor variable to a procedure is necessarily a cursor
+                    // OUTPUT parameter (T-SQL has no input cursor parameters) — the callee allocates
+                    // a cursor INTO the variable. The debugger cannot model that: the reified cursor
+                    // would live only inside the callee's per-SU batch and not survive back to the
+                    // caller. Refuse up front with a clear message instead of the misleading 137/16950
+                    // that would otherwise surface mid-session.
+                    case ExecuteStatement { ExecuteSpecification.ExecutableEntity: ExecutableProcedureReference { Parameters: { } execParams } }
+                            when execParams.FirstOrDefault(p =>
+                                p.ParameterValue is VariableReference { Name: { } actual }
+                                && cursorVariables.Contains(NormalizeVariable(actual))) is { } cursorParam:
+                        diagnostics.Add(new(s.StartLine,
+                            $"Passing a cursor variable ({((VariableReference)cursorParam.ParameterValue).Name}) to a " +
+                            "procedure (a cursor OUTPUT parameter) is not supported by the debugger (caveat C12)."));
                         break;
 
                     case DeclareTableVariableStatement tableVariable:

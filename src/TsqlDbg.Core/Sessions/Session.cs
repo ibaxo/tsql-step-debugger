@@ -1834,8 +1834,14 @@ public sealed class Session
                     ResetRowCountAfterStatement = executeAction.Unit.Fragment is SetRowCountStatement,
                 };
                 var composition = oracleFree ? baseComposition with { OracleFree = true } : baseComposition;
-                var batch = ComposeDebuggeeBatch(() => ComposedBatchBuilder.BuildForUnit(
-                    frame, _rewriteEngine!, _rewriteContext!, executeAction.Unit, frame.Cursor.Index.FullScript, _shadows!, composition));
+                // A63 (§9): a cursor-variable assignment `SET @c = CURSOR <def>` is composed as a
+                // generated `DECLARE [phys] CURSOR GLOBAL <def>` (its `SET…CURSOR` prefix is not
+                // span-patchable — §7.4 invariant 1), reifying @c as a frame-unique GLOBAL cursor.
+                var batch = executeAction.Unit.Fragment is SetVariableStatement { CursorDefinition: not null }
+                    ? ComposeDebuggeeBatch(() => ComposedBatchBuilder.BuildForCursorVariableAssign(
+                        frame, _rewriteEngine!, _rewriteContext!, executeAction.Unit, frame.Cursor.Index.FullScript, _shadows!, composition))
+                    : ComposeDebuggeeBatch(() => ComposedBatchBuilder.BuildForUnit(
+                        frame, _rewriteEngine!, _rewriteContext!, executeAction.Unit, frame.Cursor.Index.FullScript, _shadows!, composition));
                 if (PreflightDoomedTempStop(executeAction.Unit, messages) is { } preflight)
                 {
                     LastStep = preflight;                  // A14: nothing executed; cursor unchanged
@@ -4959,6 +4965,13 @@ public sealed class Session
 
         foreach (var declaration in declarations)
         {
+            if (declaration.Fragment.DataType is SqlDataTypeReference { SqlDataTypeOption: SqlDataTypeOption.Cursor })
+            {
+                frame.CursorVariables.Add(declaration.Name);  // A63 (§9): a cursor variable is reified as a
+                continue;                                     // GLOBAL cursor at its SET site, never scalar state;
+                                                              // recorded so each batch DECLAREs it real (F1: 16950)
+            }
+
             if (tableTypeDeclarations.Any(t => t.Declaration == declaration))
             {
                 continue;                                  // §8.2: a table, not a scalar
@@ -5414,8 +5427,35 @@ public sealed class Session
                 });
                 break;
 
+            case SuSubKind.CursorDeclare when unit.Fragment is SetVariableStatement { CursorDefinition: not null, Variable.Name: { } cursorVarName }:
+                // A63 (§9): reify @c as a frame-unique GLOBAL cursor, created at THIS `SET @c = CURSOR …`
+                // site (where native instantiates it). A cursor variable is batch-scoped (dies at GO like
+                // any variable), so SurvivesBatchBoundary=false — ExitBatch deallocates it. A re-SET of a
+                // still-live variable reuses the same deterministic physical name (the composed batch's
+                // CURSOR_STATUS guard deallocates+recreates it), so a duplicate registry entry is skipped.
+                if (!frame.TempObjects.All.Any(e =>
+                        !e.IsDead && e.Kind == TempObjectKind.Cursor &&
+                        string.Equals(e.OriginalName, cursorVarName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    frame.TempObjects.Add(new TempObjectEntry
+                    {
+                        OriginalName = cursorVarName,
+                        PhysicalName = RewriteContext.CursorVariablePhysicalName(cursorVarName, frame.Ordinal),
+                        Kind = TempObjectKind.Cursor,
+                        CreatedAtTrancount = _lastObservedTrancount,
+                        SurvivesBatchBoundary = false,
+                    });
+                }
+                break;
+
             case SuSubKind.CursorOp when unit.Fragment is DeallocateCursorStatement { Cursor.Name.Identifier.Value: { } deallocated }:
                 MarkChainEntryDead(deallocated, TempObjectKind.Cursor);
+                break;
+
+            case SuSubKind.CursorOp when unit.Fragment is DeallocateCursorStatement { Cursor.Name.ValueExpression: VariableReference { Name: { } deallocatedVar } }:
+                // A63: DEALLOCATE @c marks the reified cursor-variable entry dead (native semantics —
+                // fact 24 rollback mark-dead already covers cursors; this is the explicit deallocation).
+                MarkChainEntryDead(deallocatedVar, TempObjectKind.Cursor);
                 break;
 
             default:
@@ -5866,7 +5906,15 @@ public sealed class Session
                 }
             }
 
-            for (var i = startIndex; i >= 0; i--)
+            // A63 (F2): a cursor VARIABLE (its OriginalName is '@'-prefixed) is strictly
+            // FRAME-scoped — a callee's unallocated `@c` must NOT resolve to a CALLER's cursor
+            // (native gives 16950, it does not reach across frames). Named GLOBAL cursors ARE
+            // connection-scoped, so they keep the full chain walk + session-persistent tier.
+            var frameLocalCursorVariable = kind == TempObjectKind.Cursor
+                && originalName.StartsWith('@');
+            var stopIndex = frameLocalCursorVariable ? startIndex : 0;
+
+            for (var i = startIndex; i >= stopIndex; i--)
             {
                 foreach (var entry in frames.All[i].TempObjects.All.Reverse())
                 {
@@ -5903,6 +5951,13 @@ public sealed class Session
             // #temp/##global, GLOBAL cursors) promoted from prior GO batches, which survive
             // the boundary (Appendix C fact 32a; facts 1/3). Consulted AFTER the whole
             // frame chain, so a same-name object live in the current chain still wins.
+            // A63 (F2): a frame-local cursor variable never promotes here (batch-scoped, never
+            // survives a GO), so skip the connection-scoped tier for it.
+            if (frameLocalCursorVariable)
+            {
+                return null;
+            }
+
             foreach (var entry in _session._sessionTempObjects.All.Reverse())
             {
                 if (!entry.IsDead && entry.Kind == kind

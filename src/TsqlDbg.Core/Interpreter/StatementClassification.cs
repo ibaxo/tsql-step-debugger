@@ -65,7 +65,9 @@ public enum SuSubKind
     TableVarDeclare,    // DECLARE @t TABLE — interpreted no-op stop: the realization (#__dbgtv_{f}_{name})
                         // is HOISTED to frame init/push (compile-time like every DECLARE, fact 14; there
                         // is no initializer syntax, so the SU performs nothing at runtime — D7)
-    CursorDeclare,      // DECLARE c CURSOR — executable with R3 patches (rename + LOCAL→GLOBAL) + §9 registry hook
+    CursorDeclare,      // DECLARE c CURSOR — executable with R3 patches (rename + LOCAL→GLOBAL) + §9 registry hook.
+                        // A63: also `SET @c = CURSOR <def>` (cursor-variable reification) — same registry hook,
+                        // but composed by BuildForCursorVariableAssign (generated DECLARE, not a slice+patch).
     CursorOp,           // OPEN/FETCH/CLOSE/DEALLOCATE — executable, CursorId patched by R3; FETCH INTO vars
                         // are ordinary frame vars captured by the postamble; @@FETCH_STATUS is live truth (§7.4)
 }
@@ -134,6 +136,10 @@ public static class SuClassifier
             => new(SuKind.Executable, SuSubKind.CursorOp, null, null),
 
         // ---- executable leaves ----------------------------------------------------------
+        // A63 (§9): `SET @c = CURSOR <def>` reifies a cursor variable — it is a §9 registry site
+        // (creates a frame-unique GLOBAL cursor), so it classifies as CursorDeclare: boost-ineligible
+        // (not in the A21 whitelist) and routed to BuildForCursorVariableAssign, not the scalar path.
+        SetVariableStatement { CursorDefinition: not null } => new(SuKind.Executable, SuSubKind.CursorDeclare, null, null),
         SetVariableStatement => new(SuKind.Executable, SuSubKind.SetVariable, null, null),
         // A53: the value-carrying SET commands (SetCommandStatement = DATEFIRST / DATEFORMAT /
         // LANGUAGE / LOCK_TIMEOUT / DEADLOCK_PRIORITY; SetTextSizeStatement; SetRowCountStatement)

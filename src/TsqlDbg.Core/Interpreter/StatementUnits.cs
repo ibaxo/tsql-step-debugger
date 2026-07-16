@@ -207,11 +207,12 @@ public sealed record VariableDeclaration(
                 ?? throw new InvalidOperationException("DECLARE element without a variable name.");
             string name = raw.StartsWith('@') ? raw : "@" + raw;
 
-            // Cursor variables (DECLARE @c CURSOR) parse as DeclareVariableStatement with
-            // a CURSOR data type and are refused by validation (caveat C12) before any
-            // Extract call; a null DataType here is therefore an internal invariant break.
+            // A63: cursor variables (DECLARE @c CURSOR) parse as DeclareVariableStatement with a
+            // CURSOR data type; they ARE extracted here (typeSql "CURSOR") but RegisterFrameVariablesAsync
+            // skips them from scalar state (§9 reifies them as GLOBAL cursors). A null DataType is still
+            // an internal invariant break — every DECLARE element carries one.
             var typeSpan = SourceSpan.Of(d.DataType
-                ?? throw new InvalidOperationException($"DECLARE {name} without a data type — validation should have refused."));
+                ?? throw new InvalidOperationException($"DECLARE {name} without a data type — the parser guarantees one."));
             string typeSql = fullScript.Substring(typeSpan.StartOffset, typeSpan.Length);
 
             string? initSql = null;

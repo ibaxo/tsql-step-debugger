@@ -187,11 +187,16 @@ public sealed class TempObjectRegistry
         return null;
     }
 
-    /// <summary>§9/§10.4: a rollback destroyed everything created above the surviving trancount level.</summary>
+    /// <summary>§9/§10.4: a rollback destroyed everything created above the surviving trancount level.
+    /// A63 (fact 24 corrected — verified live SQL Server 2022): cursors are NON-transactional — an
+    /// open named or variable cursor survives a ROLLBACK past its creation (FETCH still returns rows).
+    /// So cursor entries are NOT marked dead here; they are torn down only at their real scope edge
+    /// (frame pop, or a GO boundary for batch-scoped cursors — ExitBatch). This also corrects a latent
+    /// named-cursor rollback infidelity that predated A63 (no fixture had probed it — DESIGN §9).</summary>
     public void MarkDeadAbove(int survivingTrancount)
     {
         foreach (var e in _entries)
-            if (!e.IsDead && e.CreatedAtTrancount > survivingTrancount)
+            if (!e.IsDead && e.Kind != TempObjectKind.Cursor && e.CreatedAtTrancount > survivingTrancount)
                 e.MarkDead();
     }
 }
@@ -227,6 +232,17 @@ public sealed class Frame
     /// </summary>
     public Dictionary<string, TableTypeVariable> TableTypeVariables { get; } =
         new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// DESIGN §9 (A63): the frame's cursor-variable names (<c>DECLARE @c CURSOR</c>), '@'-prefixed.
+    /// Like table-type variables they are deliberately absent from <see cref="Variables"/> (not
+    /// scalar state — a cursor has no literal form); a `SET @c = CURSOR FOR …` reifies each as a
+    /// GLOBAL cursor in <see cref="TempObjects"/>. Kept here so every composed batch can DECLARE
+    /// them as real (unallocated) cursor variables: an OPEN/FETCH/CLOSE/DEALLOCATE of one that was
+    /// never SET then faults with native error 16950 (statement-level, catchable) instead of a
+    /// bogus 137, and a reified reference simply rewrites to the GLOBAL name and ignores this decl.
+    /// </summary>
+    public HashSet<string> CursorVariables { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// M3 (§7.2/§10.4): the debuggee's runtime SET XACT_ABORT state, tracked from

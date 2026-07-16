@@ -2,7 +2,7 @@
 // live-verified behavior (docs/engine-facts.md facts 13/14): duplicate label (132),
 // GOTO to undeclared label (133), BREAK/CONTINUE outside WHILE (135/136), GOTO into a
 // TRY/CATCH scope (1026), RETURN-with-value in a script frame (178), script-frame
-// variable use before its declaration point (137, hoisting), cursor variables (C12).
+// variable use before its declaration point (137, hoisting), cursor-variable aliasing (C12/A63).
 using System;
 using System.Linq;
 using TsqlDbg.Core.Interpreter;
@@ -203,15 +203,46 @@ public class ControlFlowValidationTests
         Accepts("SELECT @param AS a;", FrameKind.Procedure);
     }
 
+    // A63: a plain cursor variable is SUPPORTED now (reified as a GLOBAL cursor, §9) — no longer
+    // refused. The ONE remaining unsupported shape is aliasing a cursor variable from ANOTHER
+    // cursor (`SET @c = @d`), which is refused with an honest C12 message.
     [Fact]
-    public void CursorVariable_IsRefused_WithC12Caveat_ForBothFrameKinds()
+    public void CursorVariableDeclaration_IsAccepted_ForBothFrameKinds()
     {
-        var ex = Refuses("DECLARE @c CURSOR;", FrameKind.Procedure);
-        Assert.Contains("C12", Assert.Single(ex.Diagnostics).Message);
-
-        var exScript = Refuses("DECLARE @c CURSOR;", FrameKind.Script);
-        Assert.Contains(exScript.Diagnostics, d => d.Message.Contains("C12"));
+        Accepts("DECLARE @c CURSOR;", FrameKind.Procedure);
+        Accepts("DECLARE @c CURSOR;", FrameKind.Script);
     }
+
+    [Fact]
+    public void CursorVariableAliasing_FromAnotherCursor_IsRefused_WithC12()
+    {
+        var ex = Refuses("DECLARE @c CURSOR;\nDECLARE @d CURSOR;\nSET @c = @d;");
+        var d = Assert.Single(ex.Diagnostics);
+        Assert.Equal(3, d.Line);
+        Assert.Contains("C12", d.Message);
+    }
+
+    // Creating a cursor variable via SET @c = CURSOR FOR … is NOT aliasing — it is accepted
+    // (the reification site, §9). Guards the refusal against a false positive.
+    [Fact]
+    public void CursorVariable_SetCursorFor_IsAccepted()
+        => Accepts("DECLARE @c CURSOR;\nSET @c = CURSOR FOR SELECT 1 AS v;");
+
+    // A63 (F4): passing a cursor variable to a proc is a cursor OUTPUT parameter — unsupported.
+    [Fact]
+    public void CursorVariable_PassedToProc_IsRefused_WithC12()
+    {
+        var ex = Refuses("DECLARE @c CURSOR;\nEXEC dbo.SomeProc @cur = @c OUTPUT;");
+        var d = Assert.Single(ex.Diagnostics);
+        Assert.Equal(2, d.Line);
+        Assert.Contains("C12", d.Message);
+        Assert.Contains("OUTPUT parameter", d.Message);
+    }
+
+    // An EXEC that passes ordinary scalars (no cursor variable) is not refused by the F4 guard.
+    [Fact]
+    public void Exec_WithoutCursorArgument_IsAccepted()
+        => Accepts("DECLARE @x int;\nEXEC dbo.SomeProc @a = @x;");
 
     [Fact]
     public void MultipleDiagnostics_AreAggregatedIntoOneRefusal()
@@ -225,6 +256,6 @@ public class ControlFlowValidationTests
             "SELECT 2 AS y;"));
         Assert.Equal(3, ex.Diagnostics.Count);
         Assert.Equal(new[] { 1, 2, 5 }, ex.Diagnostics.Select(d => d.Line));
-        Assert.Contains("3 error(s)", ex.Message);
+        Assert.Contains("3 problem(s)", ex.Message);
     }
 }
