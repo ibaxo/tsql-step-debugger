@@ -106,6 +106,13 @@ public sealed class Session
     // on first use and cached for the session (a type cannot change under a live session
     // without a DDL statement this session executed, which invalidates it).
     private UserTypeCatalog _userTypes = UserTypeCatalog.Empty;
+    // C14 (§9): the connected database's default collation, read once at init (rides the §4 step-2a
+    // round trip). A table variable's char columns take the DATABASE collation natively, but its
+    // #temp realization would take tempdb's — so un-COLLATE'd char columns get this appended
+    // explicitly (fact: table-variable columns inherit the DB collation, #temp columns tempdb's,
+    // verified live). Null only when the init read did not supply it (scripted unit tests), where
+    // the append is skipped and behavior is unchanged.
+    private string? _databaseCollation;
     private readonly Dictionary<string, TableTypeDefinition> _tableTypeCache =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, AliasBaseType> _aliasBaseTypes =
@@ -1559,11 +1566,19 @@ public sealed class Session
         // fake that scripts only the NOCOUNT set yields an empty catalog (no user types),
         // which is the correct answer for every pre-A59 test.
         var initResult = await ExecuteAndTraceAsync(
-            "SELECT CASE WHEN (@@OPTIONS & 512) <> 0 THEN 1 ELSE 0 END AS nocount_on; " +
+            "SELECT CASE WHEN (@@OPTIONS & 512) <> 0 THEN 1 ELSE 0 END AS nocount_on, " +
+            "CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS db_collation; " +
             "SET XACT_ABORT OFF; SET NOCOUNT ON; " + UserTypeCatalog.Query, cancellationToken).ConfigureAwait(false);
-        if (initResult.ResultSets is [{ Rows: [var noCountRow, ..] }, ..] && Convert.ToInt32(noCountRow[0]) == 0)
+        if (initResult.ResultSets is [{ Rows: [var noCountRow, ..] }, ..])
         {
-            NoteNoCountOnce();   // A56: routed to the logLevel-gated diagnostic channel, not _launchWarnings
+            if (Convert.ToInt32(noCountRow[0]) == 0)
+            {
+                NoteNoCountOnce();   // A56: routed to the logLevel-gated diagnostic channel, not _launchWarnings
+            }
+
+            // C14 (§9): DB default collation, for the table-variable realization. Rides this same
+            // round trip (A59 precedent). Absent (scripted fakes with a one-column row) → null.
+            _databaseCollation = noCountRow.Count > 1 ? noCountRow[1]?.ToString() : null;
         }
 
         _userTypes = UserTypeCatalog.FromResultSet(
@@ -1812,9 +1827,13 @@ public sealed class Session
                 // the oracle (documented A13 residual).
                 var oracleFree = executeAction.Unit.SubKind == SuSubKind.Execute
                     && !_doomed && !AnyArmedTryExists();
-                var composition = oracleFree
-                    ? DebuggeeComposition(frame) with { OracleFree = true }
-                    : DebuggeeComposition(frame);
+                // C13: the debuggee's own SET ROWCOUNT sets a non-zero limit its own batch must
+                // neutralize after capture, to keep the connection at rest (0) for later bookkeeping.
+                var baseComposition = DebuggeeComposition(frame) with
+                {
+                    ResetRowCountAfterStatement = executeAction.Unit.Fragment is SetRowCountStatement,
+                };
+                var composition = oracleFree ? baseComposition with { OracleFree = true } : baseComposition;
                 var batch = ComposeDebuggeeBatch(() => ComposedBatchBuilder.BuildForUnit(
                     frame, _rewriteEngine!, _rewriteContext!, executeAction.Unit, frame.Cursor.Index.FullScript, _shadows!, composition));
                 if (PreflightDoomedTempStop(executeAction.Unit, messages) is { } preflight)
@@ -1876,6 +1895,21 @@ public sealed class Session
                 {
                     _runtimeOptions.RecordExecuted(executeAction.Unit.Fragment);
                     NoteUntrackedOptionsOnce();
+
+                    // C13 (F2): SET ROWCOUNT <non-literal> — RecordExecuted only reads a literal, so
+                    // resolve the expression against the frame and record it; otherwise the debuggee's
+                    // subsequent statements would run UNLIMITED where native limits them (the value is
+                    // live on the connection but has no read-back intrinsic). A literal is already
+                    // recorded above; a faulting/NULL eval leaves the tracked value unchanged.
+                    if (executeAction.Unit.Fragment is SetRowCountStatement { NumberRows: { } rows and not Literal })
+                    {
+                        var resolved = await ResolveRowCountValueAsync(frame, rows, executeAction.Unit, cancellationToken)
+                            .ConfigureAwait(false);
+                        if (resolved is not null)
+                        {
+                            _runtimeOptions.SetRowCount(resolved);
+                        }
+                    }
                 }
 
                 // C2 (§21): DML against a table/view with triggers executes atomically
@@ -2078,6 +2112,7 @@ public sealed class Session
     // table-variable realizations (D8/C25).
     private BatchComposition DebuggeeComposition(Frame frame) => new()
     {
+        RowCount = _runtimeOptions.CurrentRowCount,   // C13: restore value for the TVP-copy wrap (§11.2)
         Rematerialize = _errorContexts.Count > 0 ? _errorContexts[^1].Values : null,
         XactAbortOn = frame.XactAbortOn,
         DoomedSeedValues = _doomed ? frame.Snapshot : null,
@@ -2517,7 +2552,7 @@ public sealed class Session
         var seq = ++_boostSeq;
         var batch = ComposeDebuggeeBatch(() => ComposedBatchBuilder.BuildForBoostedSubtree(
             frame, _rewriteEngine!, _rewriteContext!, current, frame.Cursor.Index.FullScript, _shadows!,
-            seq, plan.Markers, frame.XactAbortOn));
+            seq, plan.Markers, frame.XactAbortOn, _runtimeOptions.CurrentRowCount));   // C13: apply the debuggee's limit to the boosted subtree
 
         _trace.Event("boost.fire", $"line={current.Span.StartLine} seq={seq}");
         LastStep = await RunBoostedBatchAsync(batch, plan, seq, resultSets, messages, cancellationToken).ConfigureAwait(false);
@@ -4401,6 +4436,26 @@ public sealed class Session
         return (value as string ?? string.Empty, null);
     }
 
+    // C13 (F2): resolve a non-literal SET ROWCOUNT <expr> (a variable or expression) to the integer
+    // it set the connection to, so the §11.2 tracker can re-apply the debuggee's real limit around
+    // later statements. Same rewritten/error-wrapped scalar-eval pipeline as an argument; a fault or
+    // NULL returns null, leaving the tracked value unchanged (best-effort, never crashes the step).
+    private async Task<string?> ResolveRowCountValueAsync(
+        Frame frame, ScalarExpression expression, Interpreter.StatementUnit unit, CancellationToken cancellationToken)
+    {
+        var batch = ComposedBatchBuilder.BuildForScalarEval(
+            frame, _rewriteEngine!, _rewriteContext!, expression,
+            frame.Cursor.Index.FullScript, _shadows!, DebuggeeComposition(frame));
+        var run = await RunFaultableBatchAsync(batch, unit, cancellationToken).ConfigureAwait(false);
+        if (run.Outcome is not null)
+        {
+            return null;
+        }
+
+        var value = ExtractScalarObject(run.UserSets, batch);
+        return value is null or DBNull ? null : Convert.ToInt64(value).ToString();
+    }
+
     // A58 (§11.6): parse sp_executesql's @parameters string (`N'@a int, @b varchar(10) OUTPUT'`)
     // into formals by wrapping it in a synthetic CREATE PROCEDURE shell and reading
     // ProcedureStatementBodyBase.Parameters — the exact shape ExtractCalleeParameters already
@@ -4460,11 +4515,12 @@ public sealed class Session
     {
         var frames = _frames!;
         var calleeParameters = plan.Formals;
-        if (calleeParameters.Any(p => p.IsReadOnly))
-        {
-            messages.Add($"Cannot step into '{plan.DisplayName}': it takes a table-valued parameter — stepping over (C9, §11.3).");
-            return null;
-        }
+
+        // A62 (§11.3 step 2 / C9): step-into a callee with a table-valued parameter is
+        // SUPPORTED — the TVP formal is realized as a #temp like any table variable (A59) and
+        // seeded from the caller's own table-type-variable realization (a #temp → #temp copy,
+        // below). The pre-A62 blanket refusal keyed off the READONLY formal (READONLY is only
+        // ever valid on a TVP) and stepped the whole callee over; it is gone.
 
         // ---- match actuals to formals (positional then named; ScriptDom preserves
         // ---- order). Any shape the engine itself would refuse (too many args, unknown
@@ -4501,10 +4557,81 @@ public sealed class Session
         var outputPairs = new List<OutputPair>();
         var evaluated = new List<(CalleeParameter Formal, object? Value)>();
         var defaultSeeds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // A62 (§11.3 step 2 / §9): TVP formals to seed AFTER the callee's own (empty)
+        // realization is hoisted below — (caller's source table-type variable, callee formal name).
+        var tvpSeeds = new List<(TableTypeVariable Source, string CalleeFormalName)>();
         foreach (var formal in calleeParameters)
         {
-            if (!actualByFormal.TryGetValue(formal.Declaration.Name, out var actual)
-                || actual.ParameterValue is DefaultLiteral)
+            var hasActual = actualByFormal.TryGetValue(formal.Declaration.Name, out var actual);
+
+            // A62 (§11.3 step 2): a table-valued parameter. READONLY is only ever valid on a TVP,
+            // so IsReadOnly is an exact discriminator. RegisterFrameVariablesAsync has already
+            // classified this formal as a table type and will realize it as an empty #temp; here
+            // we record where its rows come from. An OMITTED TVP is native-legal and means an
+            // empty table — the realization is already empty, so there is nothing to copy.
+            // READONLY is only ever valid on a table-valued parameter, BUT a malformed
+            // `@x int READONLY` (which the engine itself rejects at the call, before the body
+            // runs) would parse with IsReadOnly=true — so confirm the formal's type actually
+            // resolves to a TABLE type before treating it as a TVP. If it does not, step over and
+            // let the engine raise its own error rather than mis-seed (or crash on the missing
+            // TableTypeVariables entry that RegisterFrameVariablesAsync would never create).
+            if (formal.IsReadOnly
+                && _userTypes.TryResolve(formal.Declaration.Fragment.DataType, out var formalType)
+                && formalType.Kind == UserTypeKind.Table)
+            {
+                if (!hasActual || actual!.ParameterValue is DefaultLiteral)
+                {
+                    continue;                                // empty table variable (native-legal)
+                }
+
+                // Native accepts only a variable OF THE TYPE as a TVP actual — never OUTPUT, never
+                // an expression. Anything else → step-over so the engine raises its own error.
+                if (actual.IsOutput
+                    || actual.ParameterValue is not VariableReference callerTableRef
+                    || !caller.TableTypeVariables.TryGetValue(callerTableRef.Name, out var callerTvp))
+                {
+                    return null;
+                }
+
+                // A62 (F1/F4): the actual must be a variable of the SAME table type as the formal.
+                // A DIFFERENT table type — even one whose columns happen to coincide — is a native
+                // operand-type clash (msg 206) raised at the call, before the body runs. The seed
+                // copies the FORMAL type's columns out of the caller realization, so a mismatch
+                // either crashes the session (columns differ → "invalid column name") or silently
+                // runs the callee over coerced rows (columns coincide → a hidden compile error).
+                // Step over and let the engine report its own 206.
+                if (!string.Equals(callerTvp.Type.Schema, formalType.Schema, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(callerTvp.Type.Name, formalType.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
+
+                tvpSeeds.Add((callerTvp, formal.Declaration.Name));
+                continue;
+            }
+
+            // A READONLY formal whose type does NOT resolve to a table type is a shape the engine
+            // rejects at the call — fall through to a step-over via the "not supplied / bad shape"
+            // handling below (or, if an actual was somehow supplied, the scalar path's own guards).
+            if (formal.IsReadOnly)
+            {
+                return null;
+            }
+
+            // A62 (F2): a caller table-type variable can be consumed ONLY by a READONLY TVP formal
+            // of its own type (handled by the branch above). Reaching here — a NON-READONLY formal
+            // (a scalar, or a table-type formal that omits READONLY, itself native msg 352) supplied
+            // a table-type variable — is a native error at the call (msg 206 / 352). Step over so the
+            // engine raises it, rather than feeding a table variable into the scalar-eval pipeline
+            // (BuildForScalarEval), which aborts with an unhandled error 137 and kills the session.
+            if (hasActual
+                && actual!.ParameterValue is VariableReference tableTypeActual
+                && caller.TableTypeVariables.ContainsKey(tableTypeActual.Name))
+            {
+                return null;
+            }
+
+            if (!hasActual || actual!.ParameterValue is DefaultLiteral)
             {
                 if (formal.Declaration.InitializerSql is not { } defaultLiteral)
                 {
@@ -4575,6 +4702,18 @@ public sealed class Session
         if (cursorSupport is not null)
         {
             messages.Add($"Cannot step into '{plan.DisplayName}': {cursorSupport} — stepping over.");
+            return null;
+        }
+
+        // A62 (§11.3 step 2 / C9): a READONLY table-valued parameter cannot be written. Native
+        // rejects a body that writes one with msg 10700 — a COMPILE error that aborts the whole
+        // batch, so nothing runs. Stepping in would let the callee's earlier statements run before
+        // the write failed — a divergence. Refuse (→ step-over) so the engine compile-fails the
+        // batch as a whole. (The realization is a writable #temp, so nothing enforces it for us.)
+        if (FindReadOnlyTvpWrite(calleeCursor, calleeParameters) is { } writtenTvp)
+        {
+            messages.Add($"Cannot step into '{plan.DisplayName}': it writes to READONLY table-valued " +
+                         $"parameter '{writtenTvp}' (native msg 10700) — stepping over (C9, §11.3).");
             return null;
         }
 
@@ -4670,6 +4809,33 @@ public sealed class Session
         // destroys them, healed empty per C25).
         await HoistTableVariableRealizationsAsync(callee, _lastObservedTrancount, cancellationToken).ConfigureAwait(false);
 
+        // A62 (§11.3 step 2 / §9): seed each TVP formal's now-hoisted (empty) realization from the
+        // caller's table-type-variable realization — a #temp → #temp copy, the v2 of A59's
+        // #temp → DECLARE @t materialization. A TVP formal is READONLY, so there is nothing to
+        // copy back at pop; the copy is one-way at push. IDENTITY values are regenerated (C28):
+        // the copy excludes the identity column (InsertableColumns) and replays rows in identity
+        // order so contiguous rows keep their values. Such an insert also moves the connection's
+        // SCOPE_IDENTITY chain (fact 34h) — the same reason A59's preamble does — so we poison the
+        // §7.4/A26 chain-sync flag; the next completed insert-family statement re-synchronizes.
+        var tvpMovesIdentity = false;
+        foreach (var (source, formalName) in tvpSeeds)
+        {
+            var target = callee.TableTypeVariables[formalName];
+            var seed = ComposedBatchBuilder.BuildTvpFormalSeed(target, source.RealizationName);
+            if (seed is not null)
+            {
+                await ExecuteAndTraceAsync(seed, cancellationToken).ConfigureAwait(false);
+            }
+
+            tvpMovesIdentity |= target.IdentityColumn is not null && target.InsertableColumns.Count > 0;
+        }
+
+        if (tvpMovesIdentity && !_scopeChainPoisoned)
+        {
+            _scopeChainPoisoned = true;
+            _trace.Event("scopeid.poison", "tvp-formal seed moved the identity chain at push (§9/§11.3, fact 34h)");
+        }
+
         frames.Push(callee);
         _trace.Event("frame.push",
             $"ordinal={callee.Ordinal} module={callee.Module.Display} depth={frames.Depth} outputPairs={outputPairs.Count} rcTarget={callSite.ReturnCodeVariable ?? "-"}");
@@ -4680,6 +4846,41 @@ public sealed class Session
         => frame.Variables.TryGet(variableName, out var slot)
             ? slot
             : throw new InvalidOperationException($"Variable {variableName} not registered — push bookkeeping bug.");
+
+    // A62 (§11.3 step 2 / C9): does the callee body WRITE a READONLY table-valued parameter — an
+    // INSERT/UPDATE/DELETE/MERGE whose target is one of the TVP formals? Native rejects such a
+    // body at COMPILE (msg 10700), so nothing runs; the debugger's realization is a writable
+    // #temp and would silently accept the write, so we must refuse the step-in (→ step-over) and
+    // let the engine compile-fail the whole batch. Index.All flattens nested control-flow blocks
+    // (StatementIndex.Walk), so a write inside an IF/WHILE/TRY body is covered. Returns the
+    // offending parameter name, or null when no TVP formal is written (the common fast path — no
+    // READONLY formal means an empty name set and an immediate null).
+    private static string? FindReadOnlyTvpWrite(ExecutionCursor cursor, IReadOnlyList<CalleeParameter> formals)
+    {
+        var tvpNames = formals
+            .Where(p => p.IsReadOnly)
+            .Select(p => p.Declaration.Name)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (tvpNames.Count == 0)
+        {
+            return null;
+        }
+
+        foreach (var su in cursor.Index.All)
+        {
+            // F3: direct target, alias-resolved target, AND OUTPUT … INTO target — every write
+            // shape the engine's msg 10700 covers (TryGetTargetVariableName caught only the first).
+            foreach (var written in DmlTargetClassifier.GetWrittenTableVariableNames(su.Fragment))
+            {
+                if (tvpNames.Contains(written))
+                {
+                    return written;
+                }
+            }
+        }
+
+        return null;
+    }
 
     // Predicate/scalar-eval single-value read, RAW (arg values must round-trip typed —
     // ExtractScalarColumn's Convert.ToInt32 is for predicates/return codes only).
@@ -4771,6 +4972,18 @@ public sealed class Session
                     StorageTypeSql = resolved.TypeSql,
                     StorageCollation = resolved.Collation,
                 });
+            }
+            else if (_databaseCollation is { Length: > 0 } dbCollation
+                     && IsCharTypeNeedingCollation(declaration.Fragment.DataType))
+            {
+                // C14 (F1): a plain char SCALAR variable takes the DATABASE collation natively, but
+                // its state-table column in tempdb would take tempdb's — the same transcode hazard
+                // §8.1 fixes for alias base types (a `varchar` value would corrupt on the per-step
+                // round trip on a code-page-different database). The storage type stays bare (the
+                // CONVERT re-seed sites reject COLLATE); only the state COLUMN DDL gains it via
+                // StorageCollation. A scalar DECLARE cannot carry its own COLLATE (a syntax error),
+                // so the database default is always the right value.
+                frame.Variables.Register(declaration with { StorageCollation = dbCollation });
             }
             else
             {
@@ -4988,28 +5201,61 @@ public sealed class Session
         TableDefinition definition, string fullScript, CancellationToken cancellationToken)
     {
         var span = SourceSpan.Of(definition);
-        var aliasColumns = new List<(SourceSpan Span, UserTypeEntry Type)>();
+
+        // Alias-typed columns: base-resolved, because tempdb cannot see the DB-scoped alias type.
+        var aliasColumns = new List<(ColumnDefinition Column, UserTypeEntry Type)>();
         foreach (var column in definition.ColumnDefinitions)
         {
             if (_userTypes.TryResolve(column.DataType, out var entry) && entry.Kind == UserTypeKind.Alias)
             {
-                aliasColumns.Add((SourceSpan.Of(column.DataType!), entry));
+                aliasColumns.Add((column, entry));
             }
         }
 
         await EnsureAliasBaseTypesAsync(aliasColumns.Select(c => c.Type).ToList(), cancellationToken)
             .ConfigureAwait(false);
 
-        var slice = new StringBuilder(fullScript.Substring(span.StartOffset, span.Length));
-        foreach (var (typeSpan, entry) in aliasColumns.OrderByDescending(c => c.Span.StartOffset))
+        // Span patches over the byte-exact source slice (§5.3), all on distinct DataType spans:
+        //   (1) alias types → base type (+ its own collation);
+        //   (2) C14: an explicit COLLATE appended to every un-COLLATE'd char column, so the #temp
+        //       realization keeps the table variable's native DATABASE collation rather than
+        //       tempdb's (verified live: table-variable char columns inherit the DB collation,
+        //       #temp columns tempdb's). Skipped when the DB collation is unknown (scripted tests).
+        // Applied descending by offset so earlier edits do not shift later spans.
+        var patches = new List<(SourceSpan Span, string Replacement)>();
+        var aliasSet = new HashSet<ColumnDefinition>(aliasColumns.Select(c => c.Column));
+
+        foreach (var (column, entry) in aliasColumns)
         {
-            // A COLUMN definition, so it takes the collation form (unlike a CONVERT target).
+            // A COLUMN definition takes the collation form (unlike a CONVERT target).
             var resolved = _aliasBaseTypes[entry.QualifiedName];
             var columnType = resolved.Collation is null
                 ? resolved.TypeSql
                 : $"{resolved.TypeSql} COLLATE {resolved.Collation}";
-            slice.Remove(typeSpan.StartOffset - span.StartOffset, typeSpan.Length)
-                 .Insert(typeSpan.StartOffset - span.StartOffset, columnType);
+            patches.Add((SourceSpan.Of(column.DataType!), columnType));
+        }
+
+        if (_databaseCollation is { Length: > 0 } dbCollation)
+        {
+            foreach (var column in definition.ColumnDefinitions)
+            {
+                if (aliasSet.Contains(column) || column.Collation is not null
+                    || !IsCharTypeNeedingCollation(column.DataType))
+                {
+                    continue;
+                }
+
+                var typeSpan = SourceSpan.Of(column.DataType!);
+                var typeText = fullScript.Substring(typeSpan.StartOffset, typeSpan.Length);
+                patches.Add((typeSpan, $"{typeText} COLLATE {dbCollation}"));
+            }
+        }
+
+        var slice = new StringBuilder(fullScript.Substring(span.StartOffset, span.Length));
+        foreach (var (patchSpan, replacement) in patches.OrderByDescending(p => p.Span.StartOffset))
+        {
+            slice.Remove(patchSpan.StartOffset - span.StartOffset, patchSpan.Length)
+                 .Insert(patchSpan.StartOffset - span.StartOffset, replacement);
         }
 
         var definitionSql = slice.ToString().Trim();
@@ -5017,6 +5263,14 @@ public sealed class Session
             ? definitionSql[1..^1]
             : definitionSql;
     }
+
+    // C14 (§9): the char types whose collation a table-variable column inherits from the database
+    // but whose #temp realization would otherwise take from tempdb. `sysname` is deliberately
+    // excluded (fixed nvarchar(128), rare as a table-variable column) — a documented residual.
+    private static bool IsCharTypeNeedingCollation(DataTypeReference? dataType)
+        => dataType is SqlDataTypeReference { SqlDataTypeOption: var opt }
+           && opt is SqlDataTypeOption.Char or SqlDataTypeOption.VarChar or SqlDataTypeOption.Text
+                  or SqlDataTypeOption.NChar or SqlDataTypeOption.NVarChar or SqlDataTypeOption.NText;
 
     // R3 (D7): a DECLARE CURSOR with neither LOCAL nor GLOBAL falls to the database's
     // CURSOR_DEFAULT; the rename model needs GLOBAL. Returns a refusal message or null.

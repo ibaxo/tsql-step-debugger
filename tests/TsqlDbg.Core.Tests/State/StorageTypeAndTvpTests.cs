@@ -290,4 +290,53 @@ public class StorageTypeAndTvpTests
             read, RewriteEngine.CreateDefault(), readCtx, read.Cursor.Index.All[0],
             read.Cursor.Index.FullScript, ShadowValues.Initial()).MovesIdentityChain);
     }
+
+    // ---- A62 (§11.3 step 2 / §9): step-INTO a callee with a TVP formal. The formal's own
+    // realization (a #temp, hoisted empty) is seeded from the CALLER's table-type-variable
+    // realization (also a #temp) — the v2 of the #temp -> DECLARE @t materialization above,
+    // target-shifted to the formal's realization. The READONLY formal is never copied back. ----
+
+    private static TableTypeVariable TvpFormalTarget(string? identityColumn = null) => new TableTypeVariable
+    {
+        Name = "@rows",
+        Type = new UserTypeEntry("dbo", "OrderRows", UserTypeKind.Table),
+        RealizationName = "#__dbgtv_2_rows",
+        InsertableColumns = new[] { "nm", "qty" },
+        IdentityColumn = identityColumn,
+    };
+
+    [Fact]
+    public void BuildTvpFormalSeed_CopiesCallerRealizationIntoTheFormalRealization()
+    {
+        // The callee's #temp is filled from the caller's #temp, same table type, same columns —
+        // no DECLARE @t (unlike the pass-as-argument case): the formal's realization already exists.
+        var seed = ComposedBatchBuilder.BuildTvpFormalSeed(TvpFormalTarget(), "#__dbgtv_1_source");
+
+        Assert.Equal(
+            "INSERT INTO [#__dbgtv_2_rows] ([nm], [qty]) SELECT [nm], [qty] FROM [#__dbgtv_1_source];",
+            seed);
+    }
+
+    [Fact]
+    public void BuildTvpFormalSeed_OrdersByTheIdentityColumn_SoIdentityValuesReplayInInsertOrder()
+    {
+        // Same load-bearing ORDER BY as A59 rider 2: identity is assigned in insert order, so a
+        // contiguous source reproduces its identity values (C28), not an artifact of the plan.
+        var seed = ComposedBatchBuilder.BuildTvpFormalSeed(TvpFormalTarget(identityColumn: "id"), "#__dbgtv_1_source");
+
+        Assert.Equal(
+            "INSERT INTO [#__dbgtv_2_rows] ([nm], [qty]) SELECT [nm], [qty] FROM [#__dbgtv_1_source] ORDER BY [id];",
+            seed);
+    }
+
+    [Fact]
+    public void BuildTvpFormalSeed_ReturnsNull_WhenTheTypeHasNoInsertableColumns()
+    {
+        // Every column IDENTITY/computed: nothing can be supplied to a table variable (fact 34e),
+        // so the realization stays empty (rides C28) rather than emitting an empty column list.
+        var allGenerated = TvpFormalTarget(identityColumn: "id");
+        allGenerated.InsertableColumns = System.Array.Empty<string>();
+
+        Assert.Null(ComposedBatchBuilder.BuildTvpFormalSeed(allGenerated, "#__dbgtv_1_source"));
+    }
 }

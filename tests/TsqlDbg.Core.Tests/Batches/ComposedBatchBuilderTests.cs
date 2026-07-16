@@ -64,6 +64,60 @@ public class ComposedBatchBuilderTests
         Assert.Contains("SELECT @Id = [Id], @Name = [Name] FROM #__dbg_s1;", batch.Text);
     }
 
+    // C13 (§11.2): the default composition (RowCount "0") emits NO ROWCOUNT lines — the resting
+    // invariant costs nothing and the byte template (and B) is unchanged when no limit is in force.
+    [Fact]
+    public void RowCount_Default_EmitsNoRowCountLines_AndBUnchanged()
+    {
+        var frame = BuildAppendixAFrame(out var ctx);
+        var unit = frame.Cursor.Index.All[0];
+        var batch = ComposedBatchBuilder.BuildForUnit(
+            frame, RewriteEngine.CreateDefault(), ctx, unit, frame.Cursor.Index.FullScript, ShadowValues.Initial());
+
+        Assert.DoesNotContain("SET ROWCOUNT", batch.Text);
+        Assert.Equal(8, batch.B);
+    }
+
+    // C13 (§11.2): a non-zero limit resets ROWCOUNT to 0 in the preamble (protecting bookkeeping),
+    // re-applies the debuggee's value on the line IMMEDIATELY before the user statement, and resets
+    // to 0 again after — so the connection is left at rest (0) for the next between-statement op.
+    [Fact]
+    public void RowCount_NonZero_ResetsInPreamble_AppliesBeforeStatement_ResetsAfter()
+    {
+        var frame = BuildAppendixAFrame(out var ctx);
+        var unit = frame.Cursor.Index.All[0];
+        var batch = ComposedBatchBuilder.BuildForUnit(
+            frame, RewriteEngine.CreateDefault(), ctx, unit, frame.Cursor.Index.FullScript, ShadowValues.Initial(),
+            BatchComposition.Default with { RowCount = "2" });
+        var lines = batch.Text.Split('\n');
+
+        Assert.Equal("SET ROWCOUNT 2;", lines[batch.B - 2]);   // apply is the line just before the statement
+        Assert.StartsWith("UPDATE dbo.T", lines[batch.B - 1]);
+        Assert.Equal(1, lines.Count(l => l == "SET ROWCOUNT 2;"));
+        Assert.Equal(2, lines.Count(l => l == "SET ROWCOUNT 0;"));   // preamble reset + trailing reset
+        // the preamble reset precedes the statement, the trailing reset follows it
+        Assert.True(Array.IndexOf(lines, "SET ROWCOUNT 0;") < batch.B - 1);
+        Assert.True(Array.LastIndexOf(lines, "SET ROWCOUNT 0;") > batch.B - 1);
+    }
+
+    // C13: the debuggee's OWN `SET ROWCOUNT n` (RowCount still "0" at build time) gets ONLY the
+    // trailing reset — its user-statement slot set a non-zero limit the resting invariant must
+    // neutralize; there is no preamble reset or pre-statement apply (nothing was in force yet).
+    [Fact]
+    public void ResetRowCountAfterStatement_WithZeroLimit_EmitsOnlyTheTrailingReset()
+    {
+        var frame = BuildAppendixAFrame(out var ctx);
+        var unit = frame.Cursor.Index.All[0];
+        var batch = ComposedBatchBuilder.BuildForUnit(
+            frame, RewriteEngine.CreateDefault(), ctx, unit, frame.Cursor.Index.FullScript, ShadowValues.Initial(),
+            BatchComposition.Default with { ResetRowCountAfterStatement = true });
+        var lines = batch.Text.Split('\n');
+
+        Assert.Equal(1, lines.Count(l => l == "SET ROWCOUNT 0;"));
+        Assert.DoesNotContain("SET ROWCOUNT 2;", batch.Text);
+        Assert.True(Array.IndexOf(lines, "SET ROWCOUNT 0;") > batch.B - 1);   // strictly after the statement
+    }
+
     [Fact]
     public void AppendixA_StateWrite_IsObjectIdGuarded_BothBranches()
     {

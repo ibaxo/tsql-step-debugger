@@ -88,6 +88,20 @@ public sealed class RuntimeOptionTracker
     /// <summary>Push-time snapshot for the §11.2 pop diff.</summary>
     public IReadOnlyDictionary<string, string> Snapshot() => new Dictionary<string, string>(_current, StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>C13 (§11.2): the session's current <c>SET ROWCOUNT</c> literal ("0" = unlimited).
+    /// The debuggee's limit persists on our one connection and correctly limits the debuggee's own
+    /// statements — but it must NOT truncate the debugger's own multi-row bookkeeping (the TVP copy
+    /// a table-type argument/formal needs, §9/§11.3). Those copies reset ROWCOUNT to 0 and restore
+    /// this value afterwards; there is no intrinsic to read the setting back at runtime, so the
+    /// value is threaded from here into the composed batch (and the §11.3 push seed).</summary>
+    public string CurrentRowCount => _current["ROWCOUNT"];
+
+    /// <summary>C13 (F2): record a SET ROWCOUNT value the caller resolved itself — a non-literal
+    /// <c>SET ROWCOUNT @v</c> / <c>SET ROWCOUNT @a+1</c> whose value the AST-only
+    /// <see cref="RecordExecuted"/> cannot read. Same effect as a recorded literal: the value is
+    /// re-applied around the debuggee's later statements and reverted at a callee's exit.</summary>
+    public void SetRowCount(string value) => _current["ROWCOUNT"] = value;
+
     /// <summary>Folds one successfully-executed SET SU into the tracked state.</summary>
     public void RecordExecuted(TSqlStatement statement)
     {

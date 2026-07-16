@@ -32,6 +32,21 @@ public sealed record BatchComposition
 {
     public static readonly BatchComposition Default = new();
 
+    /// <summary>C13 (§11.2): the debuggee's current tracked <c>SET ROWCOUNT</c> value ("0" =
+    /// unlimited). The invariant is that the connection's RESTING ROWCOUNT is always 0, so every
+    /// out-of-band bookkeeping op (the §9 TVP copy, the §4/§11.3 catalog queries, GO-boundary
+    /// rebuilds, inspection reads, watch/condition evals) runs unlimited without needing its own
+    /// wrap. When this is non-"0" the batch preamble asserts <c>SET ROWCOUNT 0</c>, re-applies this
+    /// value immediately before the user statement, and resets to 0 again after the capture — so the
+    /// debuggee statement sees exactly its limit and the connection is left at rest (0).</summary>
+    public string RowCount { get; init; } = "0";
+
+    /// <summary>C13: force the trailing <c>SET ROWCOUNT 0</c> reset even when <see cref="RowCount"/>
+    /// is "0" — set for the debuggee's OWN <c>SET ROWCOUNT n</c> statement, whose user-statement slot
+    /// sets a non-zero limit the resting invariant must immediately neutralize (the tracker keeps the
+    /// value for the next statement to re-apply). No effect on any other statement.</summary>
+    public bool ResetRowCountAfterStatement { get; init; }
+
     /// <summary>False for predicate/scalar-eval shells (side-effect-free by construction).</summary>
     public bool IncludeStateWrite { get; init; } = true;
 
@@ -469,7 +484,7 @@ public static class ComposedBatchBuilder
     public static ComposedBatch BuildForBoostedSubtree(
         Frame frame, RewriteEngine rewriteEngine, RewriteContext rewriteContext,
         StatementUnit controlNode, string fullScript, ShadowValues shadowValues,
-        int seq, IReadOnlyList<BoostMarker> markers, bool xactAbortOn = false)
+        int seq, IReadOnlyList<BoostMarker> markers, bool xactAbortOn = false, string rowCount = "0")
     {
         if (controlNode.SubKind is not (SuSubKind.If or SuSubKind.While))
         {
@@ -515,7 +530,7 @@ public static class ComposedBatchBuilder
         // running with XACT_ABORT ON must doom on an in-slice fault exactly as
         // interpreted mode would).
         var batch = Build(frame, rewriteContext, rewrite.PatchedText, rewrite.RequiredShadows, shadowValues,
-            BatchComposition.Default with { BoostSeq = seq, XactAbortOn = xactAbortOn });
+            BatchComposition.Default with { BoostSeq = seq, XactAbortOn = xactAbortOn, RowCount = rowCount });
         if (batch.Parameters is not null)
         {
             // Unreachable belt (DoomedSeedValues is already guarded off): fact 26e.
@@ -644,6 +659,21 @@ public static class ComposedBatchBuilder
         // batches ride sp_executesql, whose SET scope reverts at module exit (fact 9)
         // — irrelevant precisely because every batch begins with this line.
         Line($"SET XACT_ABORT {(composition.XactAbortOn ? "ON" : "OFF")};");
+
+        // C13 (§11.2): the debuggee's SET ROWCOUNT persists on our one connection and would truncate
+        // the debugger's OWN multi-row bookkeeping in this preamble — most importantly the §9 TVP
+        // materialization copy (SET ROWCOUNT limits INSERT … SELECT), but the invariant is general:
+        // all bookkeeping runs UNLIMITED, and the debuggee's tracked limit is re-applied only around
+        // the user statement below. Emitted only when a limit is actually in force (the fast path
+        // adds nothing). The push's own out-of-band bookkeeping is protected the same way in
+        // Session.PushCalleeFrameAsync; between statements the connection carries the debuggee's
+        // value (composition.RowCount), which this line neutralizes for the copy.
+        var applyRowCount = composition.RowCount != "0";
+        if (applyRowCount)
+        {
+            Line("SET ROWCOUNT 0;");
+        }
+
         if (composition.HealthyPrefixDdl is { Count: > 0 } healing)
         {
             // M4 (D8/C25): heal rollback-destroyed table-variable realizations while
@@ -756,6 +786,11 @@ public static class ComposedBatchBuilder
                 Line("SET XACT_ABORT ON;");                    // restore BEFORE the user statement
             }
 
+            if (applyRowCount)
+            {
+                Line($"SET ROWCOUNT {composition.RowCount};");   // C13: the debuggee's limit, for the user statement only
+            }
+
             b = lineCount + 1;
             AppendMultilineThenNewline(patchedStatementText);
             Line($";SELECT {RcVar(nonce)} = @@ROWCOUNT, {ErrVar(nonce)} = @@ERROR;");
@@ -764,10 +799,26 @@ public static class ComposedBatchBuilder
         }
         else
         {
+            if (applyRowCount)
+            {
+                Line($"SET ROWCOUNT {composition.RowCount};");   // C13: the debuggee's limit, for the user statement only
+            }
+
             b = lineCount + 1;
             AppendMultilineThenNewline(patchedStatementText);
             Line($";SELECT {RcVar(nonce)} = @@ROWCOUNT, {ErrVar(nonce)} = @@ERROR;");
             Line($"SET {ScopeIdVar(nonce)} = SCOPE_IDENTITY();");
+        }
+
+        // C13 (§11.2): restore the connection to its RESTING unlimited state after capturing the
+        // user statement's @@ROWCOUNT/@@ERROR/SCOPE_IDENTITY — so all bookkeeping BETWEEN debuggee
+        // statements (the trailing state write here, then the next GO-boundary rebuild, push,
+        // inspection read, or watch eval) runs unlimited without its own wrap. Fires when a limit
+        // was applied, or when this statement is the debuggee's own SET ROWCOUNT (which set a
+        // non-zero limit the tracker now holds for the next statement to re-apply).
+        if (applyRowCount || composition.ResetRowCountAfterStatement)
+        {
+            Line("SET ROWCOUNT 0;");
         }
 
         if (composition.IncludeStateWrite && variables.Count > 0)
@@ -852,6 +903,29 @@ public static class ComposedBatchBuilder
             emitLine($"INSERT INTO {tvp.Name} ({columns}) SELECT {columns} FROM " +
                      $"{RewriteContext.BracketIdentifier(tvp.RealizationName)}{order};");
         }
+    }
+
+    // A62 (§11.3 step 2 / §9): seed a stepped-into frame's TVP-formal realization (#temp) from the
+    // caller's table-type-variable realization (#temp). Both are the SAME table type, so the
+    // insertable column list and identity column match — this is the v2 of AppendTvpMaterialization's
+    // #temp → DECLARE @t copy, target-shifted to a #temp (the formal's realization). IDENTITY/computed
+    // columns are excluded (InsertableColumns, fact 34e → C28) and the source rows are replayed in
+    // identity order (the same load-bearing ORDER BY as A59 rider 2), so contiguous rows reproduce
+    // their identity values. Returns null when every column is IDENTITY/computed (nothing to supply)
+    // or the source has no insertable columns — the realization then stays empty.
+    public static string? BuildTvpFormalSeed(TableTypeVariable target, string sourceRealizationName)
+    {
+        if (target.InsertableColumns.Count == 0)
+        {
+            return null;
+        }
+
+        var columns = string.Join(", ", target.InsertableColumns.Select(TableTypeDefinition.Bracket));
+        var order = target.IdentityColumn is { } identity
+            ? $" ORDER BY {TableTypeDefinition.Bracket(identity)}"
+            : string.Empty;
+        return $"INSERT INTO {RewriteContext.BracketIdentifier(target.RealizationName)} ({columns}) " +
+               $"SELECT {columns} FROM {RewriteContext.BracketIdentifier(sourceRealizationName)}{order};";
     }
 
     /// <summary>

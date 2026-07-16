@@ -22,7 +22,7 @@ public sealed class P30TableTypeVariableFidelityTests
 
     [SkippableTheory]
     [InlineData(StepKind.Over, false)]
-    [InlineData(StepKind.Into, false)]     // the EXEC is C9-refused -> steps over, and RUNS (A59)
+    [InlineData(StepKind.Into, false)]     // A62: the EXEC now steps INTO the TVP callee (was C9 step-over pre-A62); result identical
     [InlineData(StepKind.Over, true)]      // pass 3: continue with boost on
     public async Task DebuggerRun_MatchesNativeRun_ForTableTypeVariable(StepKind stepKind, bool boost)
     {
