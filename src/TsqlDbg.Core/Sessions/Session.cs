@@ -1738,7 +1738,8 @@ public sealed class Session
         // C8/C9/C10 shapes, doomed session) — the switch below then executes the EXEC
         // natively, which is itself the faithful surface for erroneous calls.
         if (kind == StepKind.Into && !IsCompleted
-            && cursor.Peek() is InterpreterAction.ExecuteUnit { Unit.SubKind: SuSubKind.Execute } execIntent)
+            && cursor.Peek() is InterpreterAction.ExecuteUnit execIntent
+            && IsStepIntoCandidate(execIntent.Unit))
         {
             var intoMessages = new List<string>();
             var stepInOutcome = await TryStepIntoAsync(execIntent.Unit, intoMessages, cancellationToken).ConfigureAwait(false);
@@ -1825,13 +1826,19 @@ public sealed class Session
                 // composes oracle-free — the wrapper TRY would impose transfer
                 // semantics native only has when a TRY is armed. Doomed sessions keep
                 // the oracle (documented A13 residual).
+                // C11 (A64): in a capture frame (stepped into `INSERT <target> EXEC proc`), a
+                // result-returning statement is composed as `INSERT INTO <target> <statement>` so the
+                // callee's result stream lands in the target instead of streaming to the client.
+                var capturing = frame.CaptureTargetSql is not null
+                    && ResultCaptureClassifier.IsResultReturning(executeAction.Unit.Fragment);
                 var oracleFree = executeAction.Unit.SubKind == SuSubKind.Execute
-                    && !_doomed && !AnyArmedTryExists();
+                    && !_doomed && !AnyArmedTryExists() && !capturing;
                 // C13: the debuggee's own SET ROWCOUNT sets a non-zero limit its own batch must
                 // neutralize after capture, to keep the connection at rest (0) for later bookkeeping.
                 var baseComposition = DebuggeeComposition(frame) with
                 {
                     ResetRowCountAfterStatement = executeAction.Unit.Fragment is SetRowCountStatement,
+                    CaptureTargetSql = capturing ? frame.CaptureTargetSql : null,
                 };
                 var composition = oracleFree ? baseComposition with { OracleFree = true } : baseComposition;
                 // A63 (§9): a cursor-variable assignment `SET @c = CURSOR <def>` is composed as a
@@ -2508,6 +2515,17 @@ public sealed class Session
         }
 
         var frame = CurrentFrame;
+
+        // C11 (A64/I3): a capture frame (stepped-into INSERT…EXEC) must NOT boost — a boosted
+        // subtree runs its member statements raw (a bare SELECT is a whitelisted boost member), so
+        // the callee's result rows would stream instead of being captured into the target. Refuse →
+        // interpreted stepping, which wraps each result-returning statement (conservative-closed, A21).
+        if (frame.CaptureTargetSql is not null)
+        {
+            _trace.Event("boost.refuse", $"line={frame.Cursor.Current?.Span.StartLine} reason=insert-exec-capture");
+            return null;
+        }
+
         var current = frame.Cursor.Current;
         if (current is null || current.SubKind is not (SuSubKind.If or SuSubKind.While))
         {
@@ -3104,6 +3122,18 @@ public sealed class Session
     // captured (per-statement live truth in every regime).
     private void ObserveDebuggeeSuccess(ControlRow control, Interpreter.StatementUnit unit)
     {
+        // A63/N1 (verified live): a cursor declaration preserves @@ROWCOUNT (it retains the prior
+        // statement's value), where the composed batch's control row reports 0 (its guard predicate +
+        // preamble SETs zero it). Preserve the shadow instead of adopting the captured 0 — the inverse
+        // of the ObservePredicateEvaluation idiom. Covers both `SET @c = CURSOR FOR` (N1) and the named
+        // `DECLARE c CURSOR` (N2, pre-existing). A cursor declare is never insert-family, so the R6
+        // scope-chain resync below never applies.
+        if (unit.SubKind == SuSubKind.CursorDeclare)
+        {
+            _shadows!.ObserveCursorDeclare();
+            return;
+        }
+
         var isInsertFamily = InsertFamilyClassifier.IsInsertFamily(unit.Fragment);
         _shadows!.ObserveSuccess(control, scopeChainInSync: !_scopeChainPoisoned || isInsertFamily);
         if (_scopeChainPoisoned && isInsertFamily)
@@ -4047,7 +4077,32 @@ public sealed class Session
         FrameKind FrameKind,
         IList<TSqlStatement> Body,
         IReadOnlyList<CalleeParameter> Formals,
-        IList<ExecuteParameter> Actuals);
+        IList<ExecuteParameter> Actuals,
+        string? CaptureTargetSql = null);                    // C11 (A64): INSERT…EXEC capture target (resolved), or null
+
+    // §11.1 (A58/A64): a step-into candidate is a plain `EXEC proc` (SubKind.Execute) or an
+    // `INSERT <target> EXEC proc` (an InsertStatement whose source is an ExecuteInsertSource — C11).
+    // Both route through TryStepIntoAsync; the latter carries the capture target.
+    private static bool IsStepIntoCandidate(Interpreter.StatementUnit unit) =>
+        unit.SubKind == SuSubKind.Execute
+        || unit.Fragment is InsertStatement { InsertSpecification.InsertSource: ExecuteInsertSource };
+
+    // C11 (A64): the INSERT…EXEC target as a ready-to-splice SQL prefix — the target reference
+    // rewritten (R1/R2) to its physical name in the CALLER's scope (a #temp / table-variable
+    // realization the callee's composed batch references by name, §9), plus the optional column list
+    // byte-exact from source. Splices as `INSERT INTO <this> <callee result statement>`.
+    private string ResolveCaptureTargetSql(InsertStatement insert, Frame caller)
+    {
+        var spec = insert.InsertSpecification;
+        var callerScript = caller.Cursor.Index.FullScript;
+        var targetSql = _rewriteEngine!.Rewrite(spec.Target, callerScript, _rewriteContext!).PatchedText;
+        if (spec.Columns is { Count: > 0 } columns)
+        {
+            var cols = columns.Select(c => callerScript.Substring(c.StartOffset, c.FragmentLength));
+            targetSql += " (" + string.Join(", ", cols) + ")";
+        }
+        return targetSql;
+    }
 
     // §11.1/§11.3 step-into. Returns null to fall back to step-over — for callee
     // shapes the debugger can't push (C8 encrypted/unreadable, C9 TVP, §11.6's ineligible
@@ -4069,8 +4124,50 @@ public sealed class Session
             return null;
         }
 
-        var execute = (ExecuteStatement)unit.Fragment;
-        var specification = execute.ExecuteSpecification;
+        // C11 (A64): a step-into candidate is a plain `EXEC proc` (ExecuteStatement) OR the EXEC source
+        // of an `INSERT <target> EXEC proc` (ExecuteInsertSource); both carry an ExecuteSpecification.
+        // For the latter, captureInsert names the target the callee's result stream must land in.
+        ExecuteSpecification specification;
+        InsertStatement? captureInsert = null;
+        switch (unit.Fragment)
+        {
+            case ExecuteStatement executeStatement:
+                specification = executeStatement.ExecuteSpecification;
+                break;
+            case InsertStatement { InsertSpecification.InsertSource: ExecuteInsertSource { Execute: { } insertExec } } insert:
+                specification = insertExec;
+                captureInsert = insert;
+                break;
+            default:
+                return null;
+        }
+
+        // C11 (A64) MVP: a nested step-into INSIDE an INSERT…EXEC capture is step-over — the nested
+        // call's result stream is captured by the wrapping INSERT…EXEC composition of THIS frame
+        // instead (no capture propagation into child frames in this milestone).
+        if (caller.CaptureTargetSql is not null)
+        {
+            messages.Add("Stepping into a nested call inside an INSERT … EXEC capture is step-over in this milestone — stepping over (C11).");
+            return null;
+        }
+
+        // C11 (A64): the OUTER INSERT must be a plain `INSERT <target> EXEC` — a TOP filter caps the
+        // captured rows, and a streaming OUTPUT clause on the INSERT is a native error (msg 483). The
+        // per-statement capture models neither, so step over and let the engine apply/refuse them.
+        if (captureInsert is not null)
+        {
+            if (captureInsert.InsertSpecification.TopRowFilter is not null)
+            {
+                messages.Add("INSERT TOP (n) … EXEC is step-over in this milestone — stepping over (C11).");
+                return null;
+            }
+
+            if (captureInsert.InsertSpecification.OutputClause is not null)
+            {
+                messages.Add("INSERT … OUTPUT … EXEC is step-over (native msg 483 forbids it) — stepping over (C11).");
+                return null;
+            }
+        }
 
         // §11.6: shapes with no local frame to push. A linked-server EXEC runs remotely; an
         // EXECUTE AS clause switches the callee's security principal (C4 territory) — neither is
@@ -4087,6 +4184,12 @@ public sealed class Session
         // varchar as well as nvarchar, so no provably-nvarchar gate applies here.
         if (specification.ExecutableEntity is ExecutableStringList stringList)
         {
+            if (captureInsert is not null)
+            {
+                messages.Add("INSERT … EXEC(@sql) (dynamic source) is step-over in this milestone — stepping over (C11).");
+                return null;
+            }
+
             if (DepthLimitReached(frames, ModuleIdentity.Dynamic(null, "x").NestCost))
             {
                 return await RouteNestingLimitAsync(unit, messages).ConfigureAwait(false);
@@ -4132,6 +4235,12 @@ public sealed class Session
         // still stepped into as itself — which is what the engine would execute.
         if (blueprint is null && IsSpExecuteSqlName(nameText))
         {
+            if (captureInsert is not null)
+            {
+                messages.Add("INSERT … EXEC sp_executesql (dynamic source) is step-over in this milestone — stepping over (C11).");
+                return null;
+            }
+
             return await StepIntoSpExecuteSqlAsync(
                 caller, unit, specification, procedureEntity, messages, cancellationToken).ConfigureAwait(false);
         }
@@ -4158,15 +4267,30 @@ public sealed class Session
             return null;
         }
 
+        var procedureBody = FrameBodyResolver.ResolveProcedureBody(parsed);
+
+        // C11 (A64): capture works by prefixing each result-returning callee statement with
+        // `INSERT INTO <target> `. A few statement shapes cannot be captured faithfully that way (a
+        // CTE-headed SELECT can't be prefixed; a callee ROLLBACK/nested INSERT…EXEC/streaming-OUTPUT
+        // DML/bare FETCH would lose rows or corrupt state). Their presence anywhere in the body refuses
+        // step-into → faithful native step-over (the engine performs the capture as one batch).
+        if (captureInsert is not null
+            && CaptureSafetyScanner.FindUncapturableStatement(procedureBody) is { } uncapturable)
+        {
+            messages.Add($"Cannot step into this INSERT … EXEC: '{nameText}' contains {uncapturable} — stepping over (C11, §11.7).");
+            return null;
+        }
+
         var plan = new CalleePlan(
             nameText,
             blueprint.Definition,
             new ModuleIdentity(_options.Database, blueprint.Schema, blueprint.Name, IsScript: false),
             new SetOptionEnvironment(blueprint.QuotedIdentifier, blueprint.AnsiNulls),
             FrameKind.Procedure,
-            FrameBodyResolver.ResolveProcedureBody(parsed),
+            procedureBody,
             ExtractCalleeParameters(parsed, blueprint.Definition),
-            procedureEntity.Parameters);
+            procedureEntity.Parameters,
+            captureInsert is not null ? ResolveCaptureTargetSql(captureInsert, caller) : null);
 
         return await PushCalleeFrameAsync(plan, caller, unit, specification, messages, cancellationToken)
             .ConfigureAwait(false);
@@ -4744,6 +4868,8 @@ public sealed class Session
             // Runtime options are connection-scoped: the callee enters with the
             // caller's tracked XACT_ABORT (§11.2); the F5 preamble asserts it per batch.
             XactAbortOn = caller.XactAbortOn,
+            // C11 (A64): a stepped-into INSERT…EXEC callee captures its result stream into the target.
+            CaptureTargetSql = plan.CaptureTargetSql,
         };
 
         try
@@ -5906,20 +6032,27 @@ public sealed class Session
                 }
             }
 
-            // A63 (F2): a cursor VARIABLE (its OriginalName is '@'-prefixed) is strictly
-            // FRAME-scoped — a callee's unallocated `@c` must NOT resolve to a CALLER's cursor
-            // (native gives 16950, it does not reach across frames). Named GLOBAL cursors ARE
-            // connection-scoped, so they keep the full chain walk + session-persistent tier.
-            var frameLocalCursorVariable = kind == TempObjectKind.Cursor
-                && originalName.StartsWith('@');
-            var stopIndex = frameLocalCursorVariable ? startIndex : 0;
-
-            for (var i = startIndex; i >= stopIndex; i--)
+            // A63/N5: EvaluationFrameOrdinal never names a live frame here in practice, but if it
+            // ever named a popped one, startIndex stays -1 — the loop simply runs zero times and we
+            // fall through to the session tier. (Was a `frames.All[-1]` throw hazard before N3's rewrite.)
+            for (var i = startIndex; i >= 0; i--)
             {
+                var isOuterFrame = i < startIndex;
                 foreach (var entry in frames.All[i].TempObjects.All.Reverse())
                 {
                     if (entry.Kind != kind
                         || !string.Equals(entry.OriginalName, originalName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    // A63 (F2 + N3/N6): a LOCAL or variable cursor (SurvivesBatchBoundary=false) is
+                    // strictly FRAME-scoped — invisible from an OUTER frame. A callee's own unallocated
+                    // `@c` must fault (16950), and a caller's LOCAL named cursor must be invisible to a
+                    // stepped-into callee (native 16916), not silently resolved. Only a GLOBAL cursor (or
+                    // a #temp / table variable) walks up the chain. This subsumes the old '@'-prefix
+                    // heuristic (which also mis-scoped a delimited named cursor `[@x]` — N6).
+                    if (isOuterFrame && entry.Kind == TempObjectKind.Cursor && !entry.SurvivesBatchBoundary)
                     {
                         continue;
                     }
@@ -5950,14 +6083,9 @@ public sealed class Session
             // M8 (§5.4/§6): the session-persistent tier — connection-scoped objects (user
             // #temp/##global, GLOBAL cursors) promoted from prior GO batches, which survive
             // the boundary (Appendix C fact 32a; facts 1/3). Consulted AFTER the whole
-            // frame chain, so a same-name object live in the current chain still wins.
-            // A63 (F2): a frame-local cursor variable never promotes here (batch-scoped, never
-            // survives a GO), so skip the connection-scoped tier for it.
-            if (frameLocalCursorVariable)
-            {
-                return null;
-            }
-
+            // frame chain, so a same-name object live in the current chain still wins. Only
+            // SurvivesBatchBoundary objects are ever promoted here, so a LOCAL/variable cursor
+            // (A63) is never present — no frame-local special-case is needed at this tier.
             foreach (var entry in _session._sessionTempObjects.All.Reverse())
             {
                 if (!entry.IsDead && entry.Kind == kind

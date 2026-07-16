@@ -86,6 +86,19 @@ public sealed class ShadowValues
         ErrorNumber = 0;
     }
 
+    // A63/N1 (verified live): a cursor declaration — `DECLARE c CURSOR …` OR `SET @c = CURSOR FOR …`
+    // — does NOT modify @@ROWCOUNT; it retains the PRIOR statement's value (e.g. an `UPDATE … ; SET @c
+    // = CURSOR …; IF @@ROWCOUNT > 0` branches on the UPDATE's count). This is unlike a predicate /
+    // WAITFOR / module-DDL, which RESET it to 0. The composed batch zeroes @@ROWCOUNT anyway (its
+    // guard `IF CURSOR_STATUS(...)` predicate + the preamble SETs), so its captured control row is 0 —
+    // wrong. Preserve RowCount (and ScopeIdentity — a cursor declare can perform no identity insert);
+    // @@ERROR is 0 after any successful statement. Covers both the variable (N1) and named (N2) forms.
+    public void ObserveCursorDeclare()
+    {
+        ErrorNumber = 0;
+        // RowCount and ScopeIdentity intentionally left as-is (preserved).
+    }
+
     // Engine fact 18 (M3, verified live): at the first statement inside a CATCH block,
     // @@ERROR reads the caught error's number and @@ROWCOUNT reads 0. Called by the
     // session when a fault routes (§10.3 step 3); after that, normal per-statement

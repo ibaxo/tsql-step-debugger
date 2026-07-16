@@ -245,6 +245,17 @@ public sealed class Frame
     public HashSet<string> CursorVariables { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// DESIGN §11.1 (C11/A64): when this frame is the callee of a stepped-into
+    /// <c>INSERT &lt;target&gt; EXEC proc</c>, the target's already-resolved physical reference +
+    /// optional column list (e.g. <c>[#t__f0] (a, b)</c>), resolved once in the CALLER's scope at
+    /// push. While set, each result-returning statement of this frame is composed as
+    /// <c>INSERT INTO &lt;this&gt; &lt;statement&gt;</c> — the callee's result stream lands in the
+    /// INSERT target instead of streaming to the client, matching native capture semantics. Null for
+    /// every ordinary frame.
+    /// </summary>
+    public string? CaptureTargetSql { get; internal set; }
+
+    /// <summary>
     /// M3 (§7.2/§10.4): the debuggee's runtime SET XACT_ABORT state, tracked from
     /// executed SET SUs (session-scoped on the real connection; starts OFF because
     /// session init runs SET XACT_ABORT OFF). Load-bearing for the fact-19 sandwich:

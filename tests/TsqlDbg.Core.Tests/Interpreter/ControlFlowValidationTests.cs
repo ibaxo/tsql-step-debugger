@@ -244,6 +244,15 @@ public class ControlFlowValidationTests
     public void Exec_WithoutCursorArgument_IsAccepted()
         => Accepts("DECLARE @x int;\nEXEC dbo.SomeProc @a = @x;");
 
+    // N4 (second review): the cursor-OUTPUT refusal must also catch `INSERT … EXEC p @c OUTPUT`
+    // (the EXEC rides an ExecuteInsertSource, not a statement-level ExecuteStatement).
+    [Fact]
+    public void CursorVariable_PassedToInsertExec_IsRefused_WithC12()
+    {
+        var ex = Refuses("DECLARE @c CURSOR;\nCREATE TABLE #t (id int);\nINSERT INTO #t EXEC dbo.SomeProc @cur = @c OUTPUT;");
+        Assert.Contains(ex.Diagnostics, d => d.Message.Contains("C12") && d.Message.Contains("OUTPUT parameter"));
+    }
+
     [Fact]
     public void MultipleDiagnostics_AreAggregatedIntoOneRefusal()
     {

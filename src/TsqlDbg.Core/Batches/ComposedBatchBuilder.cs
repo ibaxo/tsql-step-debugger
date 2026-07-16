@@ -47,6 +47,14 @@ public sealed record BatchComposition
     /// value for the next statement to re-apply). No effect on any other statement.</summary>
     public bool ResetRowCountAfterStatement { get; init; }
 
+    /// <summary>C11 (A64): when stepping INTO an <c>INSERT &lt;target&gt; EXEC proc</c>, the callee's
+    /// result-returning statements must land in the INSERT target rather than stream to the client
+    /// (native "result capture" semantics). This is the target's already-resolved physical reference
+    /// plus optional column list (e.g. <c>[#t__f0] (a, b)</c>), and when non-null the builder prefixes
+    /// the user statement with <c>INSERT INTO &lt;this&gt; </c>. The session sets it only for a
+    /// result-returning SU in a capture frame; every other SU runs unwrapped.</summary>
+    public string? CaptureTargetSql { get; init; }
+
     /// <summary>False for predicate/scalar-eval shells (side-effect-free by construction).</summary>
     public bool IncludeStateWrite { get; init; } = true;
 
@@ -630,7 +638,7 @@ public static class ComposedBatchBuilder
     // locates the synthetic line inside the batch; the user-visible fault location is
     // the SU's own span (the driver knows the unit it is performing).
     private static ComposedBatch Build(
-        Frame frame, RewriteContext ctx, string patchedStatementText,
+        Frame frame, RewriteContext ctx, string rawStatementText,
         IReadOnlySet<ShadowKind> requiredShadows, ShadowValues shadowValues,
         BatchComposition composition,
         IReadOnlyList<TableTypeVariable>? tvpArguments = null)
@@ -825,6 +833,15 @@ public static class ComposedBatchBuilder
         {
             Line("BEGIN TRY");
         }
+
+        // C11 (A64): capture a result-returning statement into the INSERT target instead of
+        // streaming it to the client — `INSERT INTO <target> <SELECT|EXEC>`. Set only for a
+        // result-returning SU in a capture frame; the target is already resolved (physical name +
+        // column list) in the caller's scope, and is a connection-scoped #temp / realization the
+        // callee's batch can reference by name (§9).
+        var patchedStatementText = composition.CaptureTargetSql is { } captureTarget
+            ? $"INSERT INTO {captureTarget} {rawStatementText}"
+            : rawStatementText;
 
         int b;
         if (composition.Rematerialize is { } context)

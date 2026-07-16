@@ -176,6 +176,22 @@ public sealed class ControlFlowMap
                 path.Add(new PathStep(kind, owner, list, i));
                 paths[s] = path;
 
+                // A63 (F4 + N4): passing a cursor variable to a procedure is necessarily a cursor
+                // OUTPUT parameter (T-SQL has no input cursor parameters) — the callee allocates a
+                // cursor INTO the variable, which the debugger cannot model (the reified cursor would
+                // live only inside the callee's per-SU batch and not survive back to the caller). Refuse
+                // up front — for BOTH a statement-level `EXEC p @c OUTPUT` and an `INSERT … EXEC p @c
+                // OUTPUT` (N4: the latter rides an ExecuteInsertSource, not an ExecuteStatement).
+                if (ProcedureCallParameters(s) is { } procParams
+                    && procParams.FirstOrDefault(p =>
+                        p.ParameterValue is VariableReference { Name: { } actual }
+                        && cursorVariables.Contains(NormalizeVariable(actual))) is { } cursorArg)
+                {
+                    diagnostics.Add(new(s.StartLine,
+                        $"Passing a cursor variable ({((VariableReference)cursorArg.ParameterValue).Name}) to a " +
+                        "procedure (a cursor OUTPUT parameter) is not supported by the debugger (caveat C12)."));
+                }
+
                 switch (s)
                 {
                     case LabelStatement label:
@@ -246,21 +262,6 @@ public sealed class ControlFlowMap
                             $"SET {setTarget} = CURSOR FOR …."));
                         break;
 
-                    // A63 (F4): passing a cursor variable to a procedure is necessarily a cursor
-                    // OUTPUT parameter (T-SQL has no input cursor parameters) — the callee allocates
-                    // a cursor INTO the variable. The debugger cannot model that: the reified cursor
-                    // would live only inside the callee's per-SU batch and not survive back to the
-                    // caller. Refuse up front with a clear message instead of the misleading 137/16950
-                    // that would otherwise surface mid-session.
-                    case ExecuteStatement { ExecuteSpecification.ExecutableEntity: ExecutableProcedureReference { Parameters: { } execParams } }
-                            when execParams.FirstOrDefault(p =>
-                                p.ParameterValue is VariableReference { Name: { } actual }
-                                && cursorVariables.Contains(NormalizeVariable(actual))) is { } cursorParam:
-                        diagnostics.Add(new(s.StartLine,
-                            $"Passing a cursor variable ({((VariableReference)cursorParam.ParameterValue).Name}) to a " +
-                            "procedure (a cursor OUTPUT parameter) is not supported by the debugger (caveat C12)."));
-                        break;
-
                     case DeclareTableVariableStatement tableVariable:
                         var tableVarName = NormalizeVariable(tableVariable.Body?.VariableName?.Value);
                         if (tableVarName.Length > 0 && !visibleFrom.ContainsKey(tableVarName))
@@ -317,6 +318,17 @@ public sealed class ControlFlowMap
         if (string.IsNullOrEmpty(raw)) return string.Empty;
         return raw.StartsWith('@') ? raw : "@" + raw;
     }
+
+    // A63 (F4 + N4): the argument list of a procedure call, from either a statement-level
+    // `EXEC p …` (ExecuteStatement) or an `INSERT … EXEC p …` (ExecuteInsertSource — the EXEC
+    // rides an ExecuteSpecification directly, not an ExecuteStatement). Null for `EXEC(@sql)`
+    // (ExecutableStringList) and every non-EXEC statement.
+    private static IList<ExecuteParameter>? ProcedureCallParameters(TSqlStatement s) => s switch
+    {
+        ExecuteStatement { ExecuteSpecification.ExecutableEntity: ExecutableProcedureReference { Parameters: { } p } } => p,
+        InsertStatement { InsertSpecification.InsertSource: ExecuteInsertSource { Execute.ExecutableEntity: ExecutableProcedureReference { Parameters: { } p } } } => p,
+        _ => null,
+    };
 
     // Fact 14 probes E/G: referencing a variable textually before the end of its DECLARE
     // statement (or with no declaration at all) is engine compile error 137 — the batch
