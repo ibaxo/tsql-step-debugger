@@ -2954,8 +2954,11 @@ public sealed class Session
         for (var i = start; i >= 0; i--)
         {
             // RouteError mutates its cursor ONLY when it routes (load-bearing for this
-            // probe-in-order walk — M4 design notes §5.1).
-            if (!frames.All[i].Cursor.RouteError())
+            // probe-in-order walk — M4 design notes §5.1). Its RouteOutcome tells the walk
+            // apart: no eligible CATCH here (keep walking), a stop INSIDE the CATCH, or a
+            // transit THROUGH an empty CATCH (handled vacuously).
+            var routeOutcome = frames.All[i].Cursor.RouteError();
+            if (routeOutcome == Interpreter.RouteOutcome.NoEligibleCatch)
             {
                 continue;
             }
@@ -2968,6 +2971,40 @@ public sealed class Session
             while (frames.Depth - 1 > i)
             {
                 await PopFrameAsync(completed: false, messages, CancellationToken.None).ConfigureAwait(false);
+            }
+
+            // §10.3/§11.5 empty-CATCH transit (Fable §10 re-review 2026-07-17, findings 1+2). RouteError
+            // routed into an EMPTY CATCH — no statement to stop on — so it ran the cursor STRAIGHT THROUGH
+            // END CATCH (the cursor reports this directly via RouteOutcome; a frame-level CatchDepth delta
+            // is ambiguous when routing truncated intervening CATCH occupancies, e.g. a bare THROW out of
+            // one CATCH into an outer empty one). The error was HANDLED vacuously; the cursor now either
+            // COMPLETED the body (empty CATCH last → the frame returns normally: OUTPUT copy-back, caller
+            // continues past the EXEC) or sits on the statement AFTER END CATCH (continuation). BOTH must:
+            //   • push NO fault context and NOT ObserveFault — the CATCH is already exited, so there is no
+            //     live context to represent, and native reads @@ERROR = 0 / @@ROWCOUNT = 0 after the empty
+            //     transit (fact 18 + live probes X1/X4/X6). ObserveHandledCatchReturn zeroes the shadow so
+            //     the caller (completed) / the next statement (continuation) reads those zeros;
+            //   • RECONCILE (trim-only) — the entered-and-exited CATCH nets zero on this frame's CatchDepth
+            //     and any abnormal-popped frames above vacated theirs, so trimming to TotalCatchDepth is
+            //     exact and NEVER over-trims a still-live OUTER CATCH context (the pre-fix fall-through did
+            //     `TrimContextsTo(Σ-1)` + push here, which corrupted a caller's live CATCH — finding 2a).
+            // Completed → settle the COMPLETED pop (copy-back + @rc, cascade) via SettleCompletionAsync —
+            // NOT a phantom RoutedToCatch on a completed cursor (the crash: an unsettled depth-≥2 frame whose
+            // next cursor.Peek() threw). Frame 0 (depth 1) is a harmless no-op settle → the run ends
+            // (IsCompleted), which is why frame 0 never crashed. Continuation → the fault is handled and the
+            // cursor already sits on the resume statement; return Performed (a normal stop there). Both
+            // settle WITHOUT parking, mirroring the §10.3-step-4 unhandled-continuation settle below. Doomed
+            // empty-CATCH completion pops via PopFrameAsync's doomed branch (bookkeeping + SET restores, no
+            // copy-back), leaving the caller doomed — a doomed callee that caught its own error and returned.
+            if (routeOutcome == Interpreter.RouteOutcome.TransitedEmptyCatch)
+            {
+                _shadows!.ObserveHandledCatchReturn();         // @@ERROR = 0, @@ROWCOUNT = 0 (empty-CATCH transit)
+                ReconcileErrorContexts();
+                _trace.Event("route.emptycatch",
+                    $"frame={frames.All[i].Ordinal} completed={frames.All[i].Cursor.IsCompleted} line={originUnit.Span.StartLine}");
+                return frames.All[i].Cursor.IsCompleted
+                    ? await SettleCompletionAsync(messages).ConfigureAwait(false)
+                    : StepOutcome.Performed;
             }
 
             TrimContextsTo(TotalCatchDepth() - 1);

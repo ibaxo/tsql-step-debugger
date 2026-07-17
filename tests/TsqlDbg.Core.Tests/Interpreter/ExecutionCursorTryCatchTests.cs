@@ -96,7 +96,7 @@ public class ExecutionCursorTryCatchTests
         StepTo(c, 3);
         Assert.Equal(0, c.CatchDepth);
 
-        Assert.True(c.RouteError());
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());
 
         Assert.Equal(7, c.Current!.Span.StartLine);
         Assert.Equal(1, c.CatchDepth);
@@ -107,11 +107,11 @@ public class ExecutionCursorTryCatchTests
     }
 
     [Fact]
-    public void RouteError_NoEnclosingTry_ReturnsFalse_CursorUnchanged()
+    public void RouteError_NoEnclosingTry_ReturnsNoEligibleCatch_CursorUnchanged()
     {
         var c = Cursor("SELECT 1 AS a;\nSELECT 2 AS b;");
         var before = c.Current;
-        Assert.False(c.RouteError());
+        Assert.Equal(RouteOutcome.NoEligibleCatch, c.RouteError());
         Assert.Same(before, c.Current);
     }
 
@@ -132,15 +132,15 @@ public class ExecutionCursorTryCatchTests
             END CATCH
             """);                                       // x=3, y=6, z=10
         StepTo(c, 3);
-        Assert.True(c.RouteError());                    // inner try → inner catch
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());   // inner try → inner catch
         Assert.Equal(6, c.Current!.Span.StartLine);
         Assert.Equal(1, c.CatchDepth);
 
-        Assert.True(c.RouteError());                    // fault inside inner CATCH: inner
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());   // fault inside inner CATCH: inner
         Assert.Equal(10, c.Current!.Span.StartLine);    // try is consumed → outer catch
         Assert.Equal(1, c.CatchDepth);                  // (inner catch entry truncated)
 
-        Assert.False(c.RouteError());                   // fault inside outer CATCH: nothing left
+        Assert.Equal(RouteOutcome.NoEligibleCatch, c.RouteError()); // fault inside outer CATCH: nothing left
         Assert.Equal(10, c.Current!.Span.StartLine);
     }
 
@@ -164,11 +164,11 @@ public class ExecutionCursorTryCatchTests
             END CATCH
             """);                                       // x=2, y=6, z=9
         StepTo(c, 2);
-        Assert.True(c.RouteError());
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());
         Assert.Equal(6, c.Current!.Span.StartLine);
         Assert.Equal(1, c.CatchDepth);
 
-        Assert.True(c.RouteError());                    // nested try (inside catch) is armed
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());   // nested try (inside catch) is armed
         Assert.Equal(9, c.Current!.Span.StartLine);
         Assert.Equal(2, c.CatchDepth);                  // two catch regions occupied
     }
@@ -185,8 +185,53 @@ public class ExecutionCursorTryCatchTests
             SELECT 2 AS after;
             """);
         StepTo(c, 2);
-        Assert.True(c.RouteError());
+        Assert.Equal(RouteOutcome.TransitedEmptyCatch, c.RouteError());   // ran THROUGH the empty CATCH
         Assert.Equal(6, c.Current!.Span.StartLine);     // nothing to stop on in CATCH
+        Assert.Equal(0, c.CatchDepth);
+    }
+
+    [Fact]
+    public void RouteError_EmptyCatch_LastConstruct_TransitsAndCompletes()
+    {
+        // §10.3/§11.5 empty-CATCH transit: an empty CATCH that is the LAST construct exhausts the
+        // body — RouteError reports TransitedEmptyCatch AND the cursor completes (no phantom stop).
+        var c = Cursor("""
+            BEGIN TRY
+                SELECT 1 AS x;
+            END TRY
+            BEGIN CATCH
+            END CATCH
+            """);
+        StepTo(c, 2);
+        Assert.Equal(RouteOutcome.TransitedEmptyCatch, c.RouteError());
+        Assert.True(c.IsCompleted);
+        Assert.Equal(0, c.CatchDepth);
+    }
+
+    [Fact]
+    public void RouteError_ThrowIntoEmptyOuterCatch_TransitsEmptyCatch()
+    {
+        // A bare THROW re-raising out of an inner CATCH into an EMPTY outer CATCH: the route
+        // truncates the inner CATCH occupancy AND transits the empty outer — RouteOutcome must
+        // report the transit (a frame-level CatchDepth delta would misread this as a plain route,
+        // the §10 re-review's finding). The outer CATCH is last → the cursor completes.
+        var c = Cursor("""
+            BEGIN TRY
+                BEGIN TRY
+                    SELECT 1 AS x;
+                END TRY
+                BEGIN CATCH
+                    THROW;
+                END CATCH
+            END TRY
+            BEGIN CATCH
+            END CATCH
+            """);
+        StepTo(c, 3);
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());          // inner try → inner CATCH (THROW)
+        Assert.Equal(SuSubKind.Rethrow, c.Current!.SubKind);
+        Assert.Equal(RouteOutcome.TransitedEmptyCatch, c.RouteError());   // THROW → empty outer CATCH, transits
+        Assert.True(c.IsCompleted);
         Assert.Equal(0, c.CatchDepth);
     }
 
@@ -260,7 +305,7 @@ public class ExecutionCursorTryCatchTests
             END CATCH
             """);
         StepTo(c, 2);
-        Assert.True(c.RouteError());
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());
         StepTo(c, 6);
         Assert.Equal(SuSubKind.Rethrow, c.Current!.SubKind);
         Assert.IsType<InterpreterAction.Rethrow>(c.Peek());
@@ -358,7 +403,7 @@ public class ExecutionCursorTryCatchTests
             SELECT 3 AS done;
             """);
         StepTo(c, 2);
-        Assert.True(c.RouteError());
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());
         Assert.Equal(5, c.Current!.Span.StartLine);     // the GOTO inside CATCH
         Assert.Equal(1, c.CatchDepth);
 
@@ -416,7 +461,7 @@ public class ExecutionCursorTryCatchTests
         while (true)
         {
             iterations++;
-            Assert.True(c.RouteError());                // simulate the fault
+            Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());   // simulate the fault
             Assert.Equal(9, c.Current!.Span.StartLine); // CONTINUE inside CATCH
             Assert.Equal(1, c.CatchDepth);
             c.Advance(AdvanceSignal.Normal);            // performs the CONTINUE
@@ -468,7 +513,7 @@ public class ExecutionCursorTryCatchTests
     {
         var c = Cursor(OneTryCatch);
         StepTo(c, 3);
-        Assert.True(c.RouteError());                    // now at L7, inside CATCH
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());   // now at L7, inside CATCH
         Assert.True(c.Index.TryMapBreakpointLine(8, out var target));
         Assert.True(c.CanJumpTo(target, out _));
         c.JumpTo(target);
@@ -481,7 +526,7 @@ public class ExecutionCursorTryCatchTests
     {
         var c = Cursor(OneTryCatch);
         StepTo(c, 3);
-        Assert.True(c.RouteError());
+        Assert.Equal(RouteOutcome.EnteredCatch, c.RouteError());
         Assert.True(c.Index.TryMapBreakpointLine(10, out var target));
         Assert.False(c.CanJumpTo(target, out var reason));
         Assert.Contains("§13", reason);

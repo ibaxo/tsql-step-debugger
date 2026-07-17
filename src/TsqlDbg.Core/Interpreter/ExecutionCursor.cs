@@ -111,6 +111,30 @@ public enum EntryPhase
     InTryBlock, InCatchBlock,
 }
 
+/// <summary>
+/// §10.3/§11.5: the outcome of <see cref="ExecutionCursor.RouteError"/>. The session needs more than
+/// "did it route" — a route into an EMPTY CATCH (no stoppable statement) runs the cursor STRAIGHT
+/// THROUGH END CATCH, handling the error vacuously, and must NOT be treated like a stop inside a CATCH
+/// (no context push, the shadow @@ERROR/@@ROWCOUNT zero on the transit, and the cursor may have
+/// completed the body). Only the cursor can tell the two apart reliably — a frame-level CatchDepth
+/// delta is ambiguous when routing truncated intervening CATCH occupancies (e.g. a bare THROW
+/// re-raising out of one CATCH into an outer empty one).
+/// </summary>
+public enum RouteOutcome
+{
+    /// <summary>No eligible (armed) TRY in this frame — cursor UNCHANGED. The old <c>false</c>.</summary>
+    NoEligibleCatch,
+
+    /// <summary>Routed and STOPPED inside the CATCH (its first stoppable statement). The old <c>true</c>
+    /// for a non-empty CATCH.</summary>
+    EnteredCatch,
+
+    /// <summary>Routed into an EMPTY CATCH and ran THROUGH END CATCH — the error is handled vacuously.
+    /// The cursor is now either COMPLETED (empty CATCH last in the body) or on the first statement AFTER
+    /// END CATCH (continuation). The session applies the §10.3/§11.5 empty-CATCH transit.</summary>
+    TransitedEmptyCatch,
+}
+
 /// <summary>What the driver reports back to move the cursor.</summary>
 public abstract record AdvanceSignal
 {
@@ -425,12 +449,17 @@ public sealed class ExecutionCursor
     /// consumed on CATCH entry, eligible again only after END CATCH; fact 6's
     /// outer-scope behavior) — so eligibility is simply Phase == InTryBlock.
     /// Routed: the stack truncates to that entry, flips it to the CATCH side, and the
-    /// cursor stops on the first CATCH statement (an empty CATCH pops through to after
-    /// END CATCH). Returns false when no TRY is eligible — cursor UNCHANGED; the
-    /// session decides between native statement-level continuation and terminal
-    /// outcomes (§10.3 step 4; caller-frame unwind is M4's §11.5-abnormal).
+    /// cursor stops on the first CATCH statement — UNLESS the CATCH is empty (no stoppable
+    /// statement), in which case MoveToNextStop pops the flipped entry and the cursor runs
+    /// THROUGH END CATCH (completing the body or landing on the statement after it). The
+    /// return value distinguishes those (<see cref="RouteOutcome"/>): the session must NOT
+    /// treat an empty-CATCH transit like a stop inside a CATCH (§10.3/§11.5 empty-CATCH
+    /// transit — no context push, shadow zeroed). <see cref="RouteOutcome.NoEligibleCatch"/>
+    /// leaves the cursor UNCHANGED; the session decides between native statement-level
+    /// continuation and terminal outcomes (§10.3 step 4; caller-frame unwind is M4's
+    /// §11.5-abnormal).
     /// </summary>
-    public bool RouteError()
+    public RouteOutcome RouteError()
     {
         if (_current is null) throw new InvalidOperationException("Cursor is completed; no position to route from.");
 
@@ -439,7 +468,7 @@ public sealed class ExecutionCursor
             if (_stack[i].Phase != EntryPhase.InTryBlock) continue;
             // NOTE: HasArmedTry below must stay in lockstep with this eligibility
             // predicate — D5's oracle-free decision (§10.1) is exactly "RouteError
-            // would return false in every frame".
+            // would return NoEligibleCatch in every frame".
 
             var tryCatch = (TryCatchStatement)_stack[i].Node!;
             _stack.RemoveRange(i + 1, _stack.Count - i - 1);
@@ -448,10 +477,15 @@ public sealed class ExecutionCursor
             entry.Children = tryCatch.CatchStatements.Statements;
             entry.ChildIndex = -1;
             MoveToNextStop();
-            return true;
+            // An EMPTY CATCH (no stoppable statement) is popped by MoveToNextStop, so the
+            // flipped entry no longer occupies the stack: the route ran THROUGH END CATCH.
+            // A non-empty CATCH leaves the cursor stopped inside it (the entry survives —
+            // even if the first stop is a nested descent, THIS entry stays InCatchBlock).
+            var enteredCatch = _stack.Any(e => e.Phase == EntryPhase.InCatchBlock && ReferenceEquals(e.Node, tryCatch));
+            return enteredCatch ? RouteOutcome.EnteredCatch : RouteOutcome.TransitedEmptyCatch;
         }
 
-        return false;
+        return RouteOutcome.NoEligibleCatch;
     }
 
     /// <summary>D5/A13 (§10.1): non-mutating armed-TRY probe — true iff

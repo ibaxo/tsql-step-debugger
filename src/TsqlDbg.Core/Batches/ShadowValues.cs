@@ -112,6 +112,22 @@ public sealed class ShadowValues
         ErrorNumber = errorNumber;
     }
 
+    // §10.3/§11.5 empty-CATCH transit (verified live, probes X1/X4/X6, 2026-07-17): when a fault
+    // routes into an EMPTY CATCH (no statement to stop on — the route runs straight through END
+    // CATCH), the error is handled VACUOUSLY, and after END CATCH BOTH @@ERROR and @@ROWCOUNT read 0
+    // — @@ROWCOUNT because fact 18 zeroes it at CATCH entry and the empty CATCH runs no statement to
+    // change it; @@ERROR because there is no in-CATCH statement to leave it non-zero (unlike a NON-empty
+    // CATCH, whose first statement is where ObserveFault's fact-18 @@ERROR=number is observed). These
+    // zeros then carry across module exit (ShadowValues carry model, §11.5) so a caller reading @@ERROR
+    // /@@ROWCOUNT after the EXEC of such a callee sees 0, matching native. The session calls this instead
+    // of ObserveFault when RouteError vacated the CATCH (no net CatchDepth increase). SCOPE_IDENTITY() is
+    // left as-is (per-scope; the pop's RestoreScopeIdentity handles it).
+    public void ObserveHandledCatchReturn()
+    {
+        RowCount = 0;
+        ErrorNumber = 0;
+    }
+
     /// <summary>§10.2: the session sets this when a context is pushed / the top changes,
     /// and clears it when the stack empties. Sources R7's Err* literals.</summary>
     public void SetErrorContext(ErrorContextValues? context) => ErrorContext = context;
