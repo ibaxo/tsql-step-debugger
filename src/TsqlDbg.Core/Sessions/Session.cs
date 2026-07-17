@@ -2256,8 +2256,14 @@ public sealed class Session
     // already placed (routed / skipped / unchanged for FaultAtSite, CommandTimeout and
     // terminal) and Outcome is the step's disposition. The watchdog (§10.4) observes
     // every control row either way; the __dbg_state set refreshes the binary snapshot.
+    // deferRoute (A65/F2, Fable §10 review): when true, a fault does NOT route here — it is PENDED
+    // (like the §10.6 'all' filter) so the NEXT StepAsync performs the route at top level. The
+    // capture flush (§11.7) runs from INSIDE a pop, and routing re-entrantly there — its walk itself
+    // abnormal-pops frames — corrupts the interpreter's frame/error-context state. Pending defers the
+    // route to a clean top-level context and handles a doomed-write 3930 and a healthy 515/547 alike.
     private async Task<FaultableRun> RunFaultableBatchAsync(
-        ComposedBatch batch, Interpreter.StatementUnit unit, CancellationToken cancellationToken)
+        ComposedBatch batch, Interpreter.StatementUnit unit, CancellationToken cancellationToken,
+        bool deferRoute = false)
     {
         BatchResult batchResult;
         try
@@ -2267,7 +2273,7 @@ public sealed class Session
         catch (StatementExecutionException ex)
         {
             var failureMessages = new List<string>();
-            var failureOutcome = await HandleExecutorFailureAsync(ex, unit, failureMessages, cancellationToken).ConfigureAwait(false);
+            var failureOutcome = await HandleExecutorFailureAsync(ex, unit, failureMessages, cancellationToken, deferRoute).ConfigureAwait(false);
             return new FaultableRun(failureOutcome, null, Array.Empty<ResultSet>(), failureMessages);
         }
 
@@ -2288,7 +2294,7 @@ public sealed class Session
             var trailingMessages = new List<string>();
             var trailingOutcome = await HandleExecutorFailureAsync(
                 new StatementExecutionException(first.Message, first.SeverityClass, first.Number),
-                unit, trailingMessages, cancellationToken).ConfigureAwait(false);
+                unit, trailingMessages, cancellationToken, deferRoute).ConfigureAwait(false);
             return new FaultableRun(trailingOutcome, null, Array.Empty<ResultSet>(), trailingMessages);
         }
 
@@ -2301,7 +2307,7 @@ public sealed class Session
         }
 
         var values = BuildErrorContextValues(control, batch, unit, executingFrame.Module);   // A27: origin = the faulting frame
-        var outcome = BreakOnAllErrors
+        var outcome = BreakOnAllErrors || deferRoute
             ? PendFault(values, unit, control.XactState)
             : await PerformRouteAsync(values, unit, control.XactState,
                 terminalWhenUnhandled: unit.SubKind == SuSubKind.Throw, messages).ConfigureAwait(false);
@@ -2862,10 +2868,11 @@ public sealed class Session
     // fault → the disposition (cursor already placed).
     private async Task<StepOutcome?> RunDebuggeeBatchAsync(
         ComposedBatch batch, Interpreter.StatementUnit unit,
-        List<ResultSet> resultSets, List<string> messages, CancellationToken cancellationToken)
+        List<ResultSet> resultSets, List<string> messages, CancellationToken cancellationToken,
+        bool deferRoute = false)
     {
         await EnsureTransactionProtectionAsync(unit, messages, cancellationToken).ConfigureAwait(false);
-        var run = await RunFaultableBatchAsync(batch, unit, cancellationToken).ConfigureAwait(false);
+        var run = await RunFaultableBatchAsync(batch, unit, cancellationToken, deferRoute).ConfigureAwait(false);
         resultSets.AddRange(run.UserSets);
         messages.AddRange(run.Messages);
         if (run.Outcome is not null)
@@ -3051,7 +3058,18 @@ public sealed class Session
         // The disposition stays UnhandledContinued even when the continuation
         // completed a callee (the fault is the step's story; the adapter re-reads
         // Frames for the stack shape at every stop).
-        await SettleCompletionAsync(messages).ConfigureAwait(false);
+        var settled = await SettleCompletionAsync(messages).ConfigureAwait(false);
+        // §11.7 (A65/F3, Fable §10 review): if that settle completed a CAPTURE callee whose flush
+        // FAULTED, SettleCompletionAsync returns the routed/terminal outcome — the cursor is now at
+        // the caller's CATCH (RoutedToCatch), pended (FaultAtSite), or the session is broken
+        // (FrameFaulted). Surface THAT, not the original statement-level fault whose site the cursor
+        // no longer occupies. A normal settle (Performed/FrameCompleted) keeps UnhandledContinued.
+        if (settled.Disposition is StepDisposition.RoutedToCatch
+            or StepDisposition.FaultAtSite or StepDisposition.FrameFaulted)
+        {
+            return settled;
+        }
+
         return new StepOutcome(StepDisposition.UnhandledContinued, values);
     }
 
@@ -3131,6 +3149,21 @@ public sealed class Session
         if (unit.SubKind == SuSubKind.CursorDeclare)
         {
             _shadows!.ObserveCursorDeclare();
+            return;
+        }
+
+        // §11.7 (A65/F1, Fable §10 review): a capture-wrapped statement runs as `INSERT INTO <stage>
+        // (…) <SELECT|EXEC>`, and the stage's `seq bigint IDENTITY` makes that insert set
+        // `SCOPE_IDENTITY()` to a debugger artifact (the seq value). Its @@ROWCOUNT/@@ERROR are still
+        // native-faithful (the stage insert's rowcount = the captured SELECT's row count), but the
+        // scope chain must NOT adopt the seq — preserve the frame's modelled SCOPE_IDENTITY (pass
+        // scopeChainInSync:false) and POISON the chain (the server chain now holds the seq; a later
+        // real insert-family SU in the callee re-syncs, and R6 reads serve the shadow meanwhile).
+        if (CurrentFrame.CaptureTargetSql is not null
+            && ResultCaptureClassifier.IsResultReturning(unit.Fragment))
+        {
+            _shadows!.ObserveSuccess(control, scopeChainInSync: false);
+            _scopeChainPoisoned = true;
             return;
         }
 
@@ -3267,7 +3300,7 @@ public sealed class Session
     // values, which is exactly the fact-1b contract.
     private async Task<StepOutcome> HandleExecutorFailureAsync(
         StatementExecutionException ex, Interpreter.StatementUnit unit,
-        List<string> messages, CancellationToken cancellationToken)
+        List<string> messages, CancellationToken cancellationToken, bool deferRoute = false)
     {
         // M8 §8.3 (A35): connection-fatal — severity ≥ 20 OR a genuinely broken
         // connection (SqlConnection.State != Open after the command). Session-fatal even
@@ -3308,9 +3341,14 @@ public sealed class Session
             ex.Number, ex.SeverityClass, 1,
             ex.Procedure is not null && ex.LineNumber > 0 ? ex.LineNumber : unit.Span.StartLine,
             SynthesizeProcedure(ex.Procedure, CurrentFrame.Module), ex.Message);   // A27 (origin = the faulting callee)
-        return await PerformRouteAsync(values, unit, xactState: 0,
-            terminalWhenUnhandled: false, messages,
-            sameScopeUncatchable: true).ConfigureAwait(false);
+        // A65/F2: defer the route (pend) when the caller asked — a capture flush must not route from
+        // inside its pop. The compile-class fault is sameScopeUncatchable, which the pending route
+        // reproduces via the stored unit + xactState on the next step.
+        return deferRoute
+            ? PendFault(values, unit, xactState: 0)
+            : await PerformRouteAsync(values, unit, xactState: 0,
+                terminalWhenUnhandled: false, messages,
+                sameScopeUncatchable: true).ConfigureAwait(false);
     }
 
     // §10.2 bookkeeping: contexts and CATCH occupancies are LIFO over the same DYNAMIC
@@ -3343,7 +3381,12 @@ public sealed class Session
 
     private void TrimContextsTo(int count)
     {
-        while (_errorContexts.Count > count)
+        // A65/F2 (Fable §10 review): `TotalCatchDepth() - 1` is negative when the route lands with
+        // no open CATCH occupancy left to replace (a capture materialization fault routed at the call
+        // site while the callee's own contexts were already reconciled at its pop) — that means "trim
+        // to empty", so floor at 0 rather than underflowing RemoveAt(-1).
+        var floor = Math.Max(0, count);
+        while (_errorContexts.Count > floor)
         {
             _errorContexts.RemoveAt(_errorContexts.Count - 1);
         }
@@ -3629,7 +3672,14 @@ public sealed class Session
             return new StepOutcome(StepDisposition.FrameCompleted);
         }
 
-        await PopFrameAsync(completed: true, messages, CancellationToken.None).ConfigureAwait(false);
+        var flushOutcome = await PopFrameAsync(completed: true, messages, CancellationToken.None).ConfigureAwait(false);
+        if (flushOutcome is not null)
+        {
+            // §11.7 (A65): the popped frame was a capture callee whose materialization faulted —
+            // §10.3 placed the cursor (caller CATCH / terminal). Surface that as the step's outcome
+            // instead of the normal implicit-return cascade (the call site did not complete).
+            return flushOutcome;
+        }
 
         // The pop advanced the caller past its EXEC. If that ran the caller off its own end
         // and it is a module frame, re-park at the caller's implicit return (the cascade).
@@ -3958,8 +4008,14 @@ public sealed class Session
         var popped = false;
         while (_frames!.Depth > 1 && _frames.Current.Cursor.IsCompleted)
         {
-            await PopFrameAsync(completed: true, messages, CancellationToken.None).ConfigureAwait(false);
+            var flushOutcome = await PopFrameAsync(completed: true, messages, CancellationToken.None).ConfigureAwait(false);
             popped = true;
+            if (flushOutcome is not null)
+            {
+                // §11.7 (A65): a capture materialization faulted — §10.3 already placed the cursor
+                // (caller CATCH, or kept for a terminal). Stop settling; that outcome IS the step's.
+                return flushOutcome;
+            }
         }
 
         return popped ? new StepOutcome(StepDisposition.FrameCompleted) : StepOutcome.Performed;
@@ -3975,13 +4031,18 @@ public sealed class Session
     // While doomed, no DDL/DML runs (3930; the fact-22 forced rollback reaped every
     // mid-transaction object anyway) — SET restores still run (SETs are legal in a
     // doomed transaction, and native module exit reverts them even then, fact 9).
-    private async Task PopFrameAsync(bool completed, List<string> messages, CancellationToken cancellationToken)
+    // §11.5 pop. Returns null normally; for an INSERT…EXEC capture frame (§11.7/A65) a COMPLETED
+    // pop MATERIALIZES the stage into the real target as the caller's call-site statement, and a
+    // fault there returns the routed outcome (the caller must then NOT advance past the EXEC —
+    // the routing walk already placed the cursor).
+    private async Task<StepOutcome?> PopFrameAsync(bool completed, List<string> messages, CancellationToken cancellationToken)
     {
         var frames = _frames!;
         var callee = frames.Current;
         var callSite = callee.CallSite
             ?? throw new InvalidOperationException("Pop of a frame with no call site — root pops are the session-end path (§6).");
         var caller = frames.All[frames.Depth - 2];
+        var captureFlushSql = callee.CaptureFlushSql;   // §11.7: non-null iff this is a capture callee
 
         if (!_doomed)
         {
@@ -4054,14 +4115,103 @@ public sealed class Session
         // identically, and this runs before the return so the caller's next capture is gated.
         _scopeChainPoisoned = true;
 
-        if (completed)
+        // §11.7 (A65): an INSERT…EXEC capture frame's stage. On a COMPLETED pop it is FIRST
+        // materialized into the real target, run as the caller's call-site statement so the flush's
+        // @@ROWCOUNT/SCOPE_IDENTITY reach the R6 shadow (native's caller post-INSERT…EXEC intrinsics)
+        // and a materialization fault (515/547/2627) routes through §10.3 as a fault of that call
+        // site. An ABNORMAL pop discards the stage un-materialized — the target is left EMPTY,
+        // matching native's buffer-then-materialize atomicity (I7).
+        //
+        // F2 (Fable §10 review): a capture callee can DOOM (XACT_ABORT ON + a caught error) and still
+        // reach a completed pop. Native `INSERT … EXEC` into a doomed transaction raises 3930 (routed
+        // to a caller CATCH, target empty). The debugger cannot route that faithfully from inside a
+        // pop — routing re-entrantly, and again from the doomed→detached step-loop transition,
+        // corrupts frame/error-context state — and the session is already doomed (its only faithful
+        // exits are ROLLBACK or teardown, §10.4). So a doomed capture completion TERMINATES at the
+        // call site: honest (NEVER the pre-fix silent success), at the cost of not routing 3930 into a
+        // caller CATCH the way native does — the C11 doomed-capture residual (§11.7). A HEALTHY flush
+        // materializes and any fault (515/547/2627) is DEFERRED-routed (FlushCaptureAsync, deferRoute).
+        StepOutcome? flushOutcome = null;
+        if (captureFlushSql is not null)
         {
-            // The call site is performed; the caller resumes AFTER it. Abnormal pops
-            // never advance — the routing walk placed (or will place) the cursor.
+            if (completed && _doomed)
+            {
+                _broken = true;
+                messages.Add(
+                    "The INSERT … EXEC could not materialize its captured rows: the transaction is doomed " +
+                    "(uncommittable) — natively this is error 3930 and the target stays empty. The debugger " +
+                    "terminates the run here (the doomed session's exits are ROLLBACK or teardown, §10.4/§11.7); " +
+                    "step OVER the INSERT … EXEC for native's caller-CATCH behavior.");
+                flushOutcome = new StepOutcome(StepDisposition.FrameFaulted,
+                    new ErrorContextValues(3930, 16, 1, callSite.CallUnit.Span.StartLine, null,
+                        "The current transaction cannot be committed and the INSERT … EXEC cannot materialize its " +
+                        "captured rows. Roll back the transaction. (§11.7 doomed capture.)"));
+            }
+            else if (completed)
+            {
+                flushOutcome = await FlushCaptureAsync(
+                    frames.Current, callSite.CallUnit, captureFlushSql, callSite.CallerScopeIdentityAtEntry,
+                    callee.CaptureTargetHasIdentity, messages, cancellationToken).ConfigureAwait(false);
+            }
+
+            // F7 (Fable §10 review): a command timeout DURING the flush (EngineAttention) advertises a
+            // retry — keep the stage so a re-flush is possible rather than dropping it and forcing the
+            // whole callee to re-run (documented residual). Otherwise drop once the flush is done, but
+            // only when healthy (a DROP while doomed faults 3930; the fact-22 rollback / teardown reaps
+            // the stage anyway).
+            if (!_doomed && flushOutcome?.Disposition != StepDisposition.EngineAttention)
+            {
+                var stageBracket = RewriteContext.BracketIdentifier(CaptureStageName(callee.Ordinal));
+                await ExecuteAndTraceAsync(
+                    $"IF OBJECT_ID('tempdb..{CaptureStageName(callee.Ordinal)}') IS NOT NULL DROP TABLE {stageBracket};",
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        // The call site is performed; the caller resumes AFTER it. Abnormal pops never advance — the
+        // routing walk placed the cursor. A capture flush that FAULTED did not perform the call site
+        // (§10.3 placed the cursor at the caller's CATCH / kept it for a terminal), so it too skips.
+        if (completed && flushOutcome is null)
+        {
             frames.Current.Cursor.Advance(AdvanceSignal.Normal);
         }
 
         ReconcileErrorContexts();
+        return flushOutcome;
+    }
+
+    // §11.7 (A65): materialize a completed capture callee's stage into the real target. Composed in
+    // — and run as — the CALLER frame's call-site statement (the caller is already current; the
+    // callee was popped), so this reuses the whole §10 debuggee-batch path: faults route via §10.3
+    // (a caller TRY catches, else terminal/continuation), the flush's @@ROWCOUNT/SCOPE_IDENTITY sync
+    // through ObserveDebuggeeSuccess (native's caller post-INSERT…EXEC intrinsics — closes most of
+    // I9), and the "(N rows affected)" note fires once with the total. Returns the routed outcome on
+    // a fault (caller must not advance past the EXEC), null on success.
+    private async Task<StepOutcome?> FlushCaptureAsync(
+        Frame caller, Interpreter.StatementUnit callSiteUnit, string flushSql,
+        decimal? callerScopeIdentityPreCall, bool targetHasIdentity,
+        List<string> messages, CancellationToken cancellationToken)
+    {
+        var batch = ComposeDebuggeeBatch(() => ComposedBatchBuilder.BuildForCaptureFlush(
+            caller, _rewriteContext!, flushSql, _shadows!, DebuggeeComposition(caller)));
+        var flushSets = new List<ResultSet>();
+        var outcome = await RunDebuggeeBatchAsync(batch, callSiteUnit, flushSets, messages, cancellationToken, deferRoute: true)
+            .ConfigureAwait(false);
+
+        // F6 (Fable §10 review): a ZERO-row flush into an IDENTITY target must not move the caller's
+        // SCOPE_IDENTITY — native leaves it at the pre-call value (a 0-row insert generates no
+        // identity), but the flush's control row reports SCOPE_IDENTITY() = NULL, which
+        // ObserveDebuggeeSuccess (insert-family) would adopt. Restore the pre-call value and re-poison.
+        // A non-identity target already reads NULL faithfully (Fable P1), so it is left alone.
+        if (outcome is null && targetHasIdentity && _shadows!.RowCount == 0)
+        {
+            _shadows.RestoreScopeIdentity(callerScopeIdentityPreCall);
+            _scopeChainPoisoned = true;
+        }
+
+        _trace.Event("capture.flush",
+            $"callSite=line {callSiteUnit.Span.StartLine} outcome={(outcome is null ? "ok" : outcome.Disposition.ToString())}");
+        return outcome;
     }
 
     // A58 (§11.6): everything a callee frame needs, however it was sourced — a catalog module
@@ -4078,7 +4228,7 @@ public sealed class Session
         IList<TSqlStatement> Body,
         IReadOnlyList<CalleeParameter> Formals,
         IList<ExecuteParameter> Actuals,
-        string? CaptureTargetSql = null);                    // C11 (A64): INSERT…EXEC capture target (resolved), or null
+        CaptureStagePlan? CaptureStage = null);              // C11 (A65): INSERT…EXEC capture staging plan, or null
 
     // §11.1 (A58/A64): a step-into candidate is a plain `EXEC proc` (SubKind.Execute) or an
     // `INSERT <target> EXEC proc` (an InsertStatement whose source is an ExecuteInsertSource — C11).
@@ -4091,18 +4241,65 @@ public sealed class Session
     // rewritten (R1/R2) to its physical name in the CALLER's scope (a #temp / table-variable
     // realization the callee's composed batch references by name, §9), plus the optional column list
     // byte-exact from source. Splices as `INSERT INTO <this> <callee result statement>`.
-    private string ResolveCaptureTargetSql(InsertStatement insert, Frame caller)
+    // §11.7 (C11/A65): resolve the staging plan for an `INSERT <target> EXEC` capture, or refuse
+    // (→ step-over, where native performs the whole capture as one batch — faithful). The target's
+    // physical reference and (optional) explicit column list are resolved ONCE in the caller's scope
+    // (R1/R2), and the stage's schema is derived from the target by a describe round-trip (the A59
+    // server-as-oracle move — no client-side type mapping). `ordinal` is the callee frame's, peeked.
+    private async Task<CaptureStageResolution> ResolveCaptureStageAsync(
+        InsertStatement insert, Frame caller, int ordinal, CancellationToken cancellationToken)
     {
         var spec = insert.InsertSpecification;
         var callerScript = caller.Cursor.Index.FullScript;
-        var targetSql = _rewriteEngine!.Rewrite(spec.Target, callerScript, _rewriteContext!).PatchedText;
-        if (spec.Columns is { Count: > 0 } columns)
+        var targetPhysicalSql = _rewriteEngine!.Rewrite(spec.Target, callerScript, _rewriteContext!).PatchedText;
+
+        // F4 (Fable §10 review): a VIEW target diverges — `describe_first_result_set` marks a view's
+        // derived columns `is_computed`, which the no-list planner would silently FILTER, so the flush
+        // succeeds where native `INSERT <view> EXEC` hard-refuses (msg 4406, uncatchable, the callee
+        // never runs). Refuse capture into a view (→ step-over, native-faithful). A `#temp`/`##global`/
+        // table-variable realization (all contain `#`) is a base table by construction — skip the probe.
+        if (!targetPhysicalSql.Contains('#'))
         {
-            var cols = columns.Select(c => callerScript.Substring(c.StartOffset, c.FragmentLength));
-            targetSql += " (" + string.Join(", ", cols) + ")";
+            var isViewProbe = await ExecuteAndTraceAsync(
+                $"SELECT OBJECTPROPERTY(OBJECT_ID(N'{targetPhysicalSql.Replace("'", "''")}'), 'IsView');",
+                cancellationToken).ConfigureAwait(false);
+            var isView = isViewProbe.ResultSets is [{ Rows: [[var flag, ..], ..] }, ..]
+                && flag is not null && Convert.ToInt32(flag) == 1;
+            if (isView)
+            {
+                return CaptureStageResolution.Refuse("the INSERT target is a view (native msg 4406)");
+            }
         }
-        return targetSql;
+
+        var hasExplicitColumnList = spec.Columns is { Count: > 0 };
+        string projectionSelect;
+        string targetColumnListSql;
+        if (hasExplicitColumnList)
+        {
+            var cols = spec.Columns.Select(c => callerScript.Substring(c.StartOffset, c.FragmentLength)).ToList();
+            targetColumnListSql = " (" + string.Join(", ", cols) + ")";
+            projectionSelect = $"SELECT {string.Join(", ", cols)} FROM {targetPhysicalSql}";
+        }
+        else
+        {
+            targetColumnListSql = string.Empty;
+            projectionSelect = $"SELECT * FROM {targetPhysicalSql}";
+        }
+
+        var describe = await ExecuteAndTraceAsync(
+            CaptureStagePlanner.BuildDescribeQuery(projectionSelect), cancellationToken).ConfigureAwait(false);
+        var described = CaptureStagePlanner.ParseDescribe(
+            describe.ResultSets.Count > 0 ? describe.ResultSets[0] : null);
+
+        var seqColumnName = $"__dbg{_nonce}_seq";
+        return CaptureStagePlanner.BuildPlan(
+            CaptureStageName(ordinal), seqColumnName, targetPhysicalSql, targetColumnListSql,
+            hasExplicitColumnList, described);
     }
+
+    // §11.7 (A65): a capture stage's frame-unique #temp name — nonce-namespaced (CLAUDE.md rule 4)
+    // and ordinal-keyed, so the pop can reconstruct it without threading a field through the frame.
+    private string CaptureStageName(int ordinal) => $"#__dbgcap{_nonce}_{ordinal}";
 
     // §11.1/§11.3 step-into. Returns null to fall back to step-over — for callee
     // shapes the debugger can't push (C8 encrypted/unreadable, C9 TVP, §11.6's ineligible
@@ -4281,6 +4478,22 @@ public sealed class Session
             return null;
         }
 
+        CaptureStagePlan? captureStage = null;
+        if (captureInsert is not null)
+        {
+            // §11.7 (A65): derive the capture stage from the target (describe round-trip + gates).
+            // A refusal steps the capture OVER — native performs it as one batch, faithful.
+            var resolution = await ResolveCaptureStageAsync(
+                captureInsert, caller, frames.PeekNextOrdinal(), cancellationToken).ConfigureAwait(false);
+            if (resolution.RefusalReason is { } reason)
+            {
+                messages.Add($"Cannot step into this INSERT … EXEC: {reason} — stepping over (C11, §11.7).");
+                return null;
+            }
+
+            captureStage = resolution.Plan;
+        }
+
         var plan = new CalleePlan(
             nameText,
             blueprint.Definition,
@@ -4290,7 +4503,7 @@ public sealed class Session
             procedureBody,
             ExtractCalleeParameters(parsed, blueprint.Definition),
             procedureEntity.Parameters,
-            captureInsert is not null ? ResolveCaptureTargetSql(captureInsert, caller) : null);
+            captureStage);
 
         return await PushCalleeFrameAsync(plan, caller, unit, specification, messages, cancellationToken)
             .ConfigureAwait(false);
@@ -4868,8 +5081,11 @@ public sealed class Session
             // Runtime options are connection-scoped: the callee enters with the
             // caller's tracked XACT_ABORT (§11.2); the F5 preamble asserts it per batch.
             XactAbortOn = caller.XactAbortOn,
-            // C11 (A64): a stepped-into INSERT…EXEC callee captures its result stream into the target.
-            CaptureTargetSql = plan.CaptureTargetSql,
+            // C11 (A65): a stepped-into INSERT…EXEC callee BUFFERS its result stream in a per-frame
+            // stage; the fields are set below once the stage table exists (server-side push).
+            CaptureTargetSql = plan.CaptureStage?.StageInsertTarget,
+            CaptureFlushSql = plan.CaptureStage?.FlushCoreSql,
+            CaptureTargetHasIdentity = plan.CaptureStage?.TargetHasIdentity ?? false,
         };
 
         try
@@ -4907,6 +5123,19 @@ public sealed class Session
         // The push writes tempdb — resurrect the safety net first when detached.
         await EnsureTransactionProtectionAsync(unit, messages, cancellationToken).ConfigureAwait(false);
         await ExecuteAndTraceAsync(StateTableDdlBuilder.BuildCreateTable(callee.Ordinal, callee.Variables.All), cancellationToken).ConfigureAwait(false);
+
+        // C11 (A65, §11.7): create this capture frame's stage table. It is SYNTHETIC — no debuggee
+        // source references it, so it is deliberately NOT registered in the frame's TempObjects (R2
+        // never resolves it, and the registry never reconciles it). Its lifetime is push → pop with
+        // no debuggee ROLLBACK in between (CaptureSafetyScanner refuses transaction control in the
+        // callee body), so PopFrameAsync drops it explicitly on both pop flavors (flush-then-drop on
+        // a completed pop; discard on an abnormal pop, leaving the target untouched — I7). A doomed
+        // force-rollback (fact 22) reaps it like any trancount ≥ 1 #temp; session teardown otherwise.
+        if (plan.CaptureStage is { } stage)
+        {
+            await ExecuteAndTraceAsync(stage.StageCreateDdl, cancellationToken).ConfigureAwait(false);
+        }
+
         await ExecuteAndTraceAsync(StateTableDdlBuilder.BuildSeedInsert(callee.Ordinal, callee.Variables.All, defaultSeeds), cancellationToken).ConfigureAwait(false);
         if (evaluated.Count > 0)
         {

@@ -20,6 +20,10 @@ public sealed class P39InsertExecStepIntoFidelityTests
     [InlineData("dbo.p39_insert_exec", StepKind.Into, false)]   // A64: push the callee frame, redirect result sets into #t
     [InlineData("dbo.p39_cte_caller", StepKind.Into, false)]    // S1: CTE callee refused → faithful step-over
     [InlineData("dbo.p39_boost_caller", StepKind.Into, true)]   // I3: boost refused in a capture frame → interpreted capture
+    [InlineData("dbo.p39_atomic_caller", StepKind.Into, false)] // I7 (A65): mid-capture fault → target EMPTY, side effects intact
+    [InlineData("dbo.p39_phantom_caller", StepKind.Into, false)]// A65 success-path: callee reads target mid-capture → no phantom rows
+    [InlineData("dbo.p39_scopeid_caller", StepKind.Into, false)]// F1: stage seq IDENTITY must not corrupt the callee SCOPE_IDENTITY
+    [InlineData("dbo.p39_flushfault_caller", StepKind.Into, false)] // deferRoute: CHECK violation at the flush → caller CATCH (547), atomic
     public async Task DebuggerRun_MatchesNativeRun(string procedure, StepKind stepKind, bool boost)
     {
         var rawConnectionString = Environment.GetEnvironmentVariable(ConnEnvVar);

@@ -168,6 +168,22 @@ public static class ComposedBatchBuilder
             composition ?? BatchComposition.Default, CollectTvpArguments(unit.Fragment, frame));
     }
 
+    // DESIGN §11.7 (C11/A65): the materialization of an INSERT…EXEC capture's stage into the real
+    // target, run at the callee's COMPLETED pop. <paramref name="flushSql"/> is ALREADY fully
+    // resolved — physical target + stage names, no source references — so there is nothing to
+    // rewrite (empty RequiredShadows). It is composed in the CALLER's frame so its §7.1 control row
+    // carries the flush's @@ROWCOUNT / SCOPE_IDENTITY (the caller's post-INSERT…EXEC intrinsics =
+    // native's total-captured count / last identity — closes most of I9) and so a target-constraint
+    // fault (515/547/2627 at materialization) routes as a fault of the caller's INSERT…EXEC call
+    // site (§10.3). The oracle is kept (this IS a debuggee data write, not a debugger-initiated eval).
+    public static ComposedBatch BuildForCaptureFlush(
+        Frame callerFrame, RewriteContext rewriteContext, string flushSql,
+        ShadowValues shadowValues, BatchComposition? composition = null)
+    {
+        return Build(callerFrame, rewriteContext, flushSql,
+            new HashSet<ShadowKind>(), shadowValues, composition ?? BatchComposition.Default);
+    }
+
     // DESIGN §9 (A63): a cursor-variable assignment `SET @c = CURSOR <def>` cannot be span-patched
     // in place — its leading `SET @c = CURSOR` is keyword/operator tokens, not AST fragments, so
     // §7.4 invariant 1 forbids a raw-offset patch. It is composed like BuildSyntheticAssignment /

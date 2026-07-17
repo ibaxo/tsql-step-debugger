@@ -245,15 +245,35 @@ public sealed class Frame
     public HashSet<string> CursorVariables { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// DESIGN §11.1 (C11/A64): when this frame is the callee of a stepped-into
-    /// <c>INSERT &lt;target&gt; EXEC proc</c>, the target's already-resolved physical reference +
-    /// optional column list (e.g. <c>[#t__f0] (a, b)</c>), resolved once in the CALLER's scope at
+    /// DESIGN §11.7 (C11/A65): when this frame is the callee of a stepped-into
+    /// <c>INSERT &lt;target&gt; EXEC proc</c>, the per-frame STAGE table's insert reference +
+    /// column list (e.g. <c>[#__dbgcap…] ([a], [b])</c>), resolved once in the CALLER's scope at
     /// push. While set, each result-returning statement of this frame is composed as
-    /// <c>INSERT INTO &lt;this&gt; &lt;statement&gt;</c> — the callee's result stream lands in the
-    /// INSERT target instead of streaming to the client, matching native capture semantics. Null for
-    /// every ordinary frame.
+    /// <c>INSERT INTO &lt;this&gt; &lt;statement&gt;</c> — the callee's result stream is BUFFERED in
+    /// the stage instead of streaming to the client, and materialized into the real target only at a
+    /// COMPLETED pop (<see cref="CaptureFlushSql"/>), matching native's buffer-then-materialize
+    /// semantics. A64 wrote the real target here and materialized incrementally; A65 stages so a
+    /// mid-capture fault leaves the target empty (I7) and the callee cannot observe captured-so-far
+    /// rows (success-path fidelity). Null for every ordinary frame.
     /// </summary>
     public string? CaptureTargetSql { get; internal set; }
+
+    /// <summary>
+    /// DESIGN §11.7 (C11/A65): the materialization statement for this capture frame's stage —
+    /// <c>INSERT INTO &lt;target&gt; (…) SELECT (…) FROM &lt;stage&gt; ORDER BY &lt;seq&gt;</c> —
+    /// run once at a COMPLETED pop (after any OUTPUT copy-back, before the stage is dropped). A fault
+    /// here routes as a fault of the caller's <c>INSERT … EXEC</c> call site (§10.3). Set together
+    /// with <see cref="CaptureTargetSql"/>; null for every ordinary frame.
+    /// </summary>
+    public string? CaptureFlushSql { get; internal set; }
+
+    /// <summary>
+    /// DESIGN §11.7 (C11/A65, F6): whether this capture frame's target has an IDENTITY column. A
+    /// zero-row flush into an identity target must NOT move the caller's <c>SCOPE_IDENTITY()</c>
+    /// (native leaves it at the pre-call value; a 0-row insert generates no identity), whereas the
+    /// flush's control row would report <c>NULL</c>. Set together with <see cref="CaptureFlushSql"/>.
+    /// </summary>
+    public bool CaptureTargetHasIdentity { get; internal set; }
 
     /// <summary>
     /// M3 (§7.2/§10.4): the debuggee's runtime SET XACT_ABORT state, tracked from
@@ -343,6 +363,11 @@ public sealed class FrameStack
 
     /// <summary>Reserves the next monotonic frame ordinal (§11.4).</summary>
     public int NextOrdinal() => _nextOrdinal++;
+
+    /// <summary>The ordinal <see cref="NextOrdinal"/> will return next, WITHOUT consuming it —
+    /// so a capture stage's frame-unique name (§11.7/A65) can be built before the push that
+    /// assigns the ordinal. Single-threaded (§3), so the peek and the subsequent reserve agree.</summary>
+    public int PeekNextOrdinal() => _nextOrdinal;
 
     public static FrameStack CreateRoot(Frame root)
     {
