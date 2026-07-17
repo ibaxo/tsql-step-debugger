@@ -4477,30 +4477,20 @@ public sealed class Session
         // varchar as well as nvarchar, so no provably-nvarchar gate applies here.
         if (specification.ExecutableEntity is ExecutableStringList stringList)
         {
-            if (captureInsert is not null)
-            {
-                messages.Add("INSERT … EXEC(@sql) (dynamic source) is step-over in this milestone — stepping over (C11).");
-                return null;
-            }
-
-            // C11 (A67, §11.7): a dynamic child inside a capture cannot propagate — its dynamic body
-            // is not redirected, so it would stream to the client instead of the stage (dynamic-source
-            // capture is a separate unbuilt item). Step OVER, where native captures it as one batch.
-            if (propagateCapture)
-            {
-                messages.Add("Stepping into EXEC(@sql) inside an INSERT … EXEC capture is step-over (dynamic-source capture is unbuilt) — stepping over (C11, §11.7).");
-                return null;
-            }
-
             if (DepthLimitReached(frames, ModuleIdentity.Dynamic(null, "x").NestCost))
             {
                 return await RouteNestingLimitAsync(unit, messages).ConfigureAwait(false);
             }
 
+            // C11 (A68, §11.7): EXEC(@sql) is a dynamic-source capture OWNER (captureInsert set) or, when
+            // an ancestor is already capturing, a PROPAGATING child (propagateCapture). Both are threaded
+            // into StepIntoDynamicAsync, which re-scans the parsed dynamic body and builds/inherits the
+            // stage — native buffers the dynamic result stream into the target identically to a procedure
+            // (fact 36a/d). Refused sub-cases (unsafe body, describe/target gate) step OVER, native-faithful.
             return await StepIntoDynamicAsync(
                 caller, unit, specification, stringList.Strings, requireNVarchar: false,
                 paramsExpression: null, actuals: new List<ExecuteParameter>(), displayName: "EXEC(…)",
-                messages, cancellationToken).ConfigureAwait(false);
+                captureInsert, propagateCapture, messages, cancellationToken).ConfigureAwait(false);
         }
 
         if (specification.ExecutableEntity is not ExecutableProcedureReference procedureEntity)
@@ -4537,22 +4527,14 @@ public sealed class Session
         // still stepped into as itself — which is what the engine would execute.
         if (blueprint is null && IsSpExecuteSqlName(nameText))
         {
-            if (captureInsert is not null)
-            {
-                messages.Add("INSERT … EXEC sp_executesql (dynamic source) is step-over in this milestone — stepping over (C11).");
-                return null;
-            }
-
-            // C11 (A67, §11.7): as with EXEC(@sql), a dynamic sp_executesql child cannot propagate a
-            // capture — step OVER (native captures it as one batch).
-            if (propagateCapture)
-            {
-                messages.Add("Stepping into sp_executesql inside an INSERT … EXEC capture is step-over (dynamic-source capture is unbuilt) — stepping over (C11, §11.7).");
-                return null;
-            }
-
+            // C11 (A68, §11.7): sp_executesql is a dynamic-source capture OWNER (captureInsert) or a
+            // PROPAGATING child (propagateCapture) — threaded through StepIntoSpExecuteSqlAsync into
+            // StepIntoDynamicAsync, which re-scans the dynamic body and builds/inherits the stage (fact
+            // 36a/c/d/f). Its provably-nvarchar gate still applies: a non-nvarchar @statement steps OVER,
+            // where native raises its own msg 214 (and captures nothing) — faithful.
             return await StepIntoSpExecuteSqlAsync(
-                caller, unit, specification, procedureEntity, messages, cancellationToken).ConfigureAwait(false);
+                caller, unit, specification, procedureEntity, captureInsert, propagateCapture,
+                messages, cancellationToken).ConfigureAwait(false);
         }
 
         if (blueprint is null)
@@ -4678,8 +4660,8 @@ public sealed class Session
     // natively. Everything after the two is a user argument, positional or named.
     private async Task<StepOutcome?> StepIntoSpExecuteSqlAsync(
         Frame caller, Interpreter.StatementUnit unit, ExecuteSpecification specification,
-        ExecutableProcedureReference procedureEntity, List<string> messages,
-        CancellationToken cancellationToken)
+        ExecutableProcedureReference procedureEntity, InsertStatement? captureInsert, bool propagateCapture,
+        List<string> messages, CancellationToken cancellationToken)
     {
         ExecuteParameter? statementArg = null;
         ExecuteParameter? paramsArg = null;
@@ -4723,7 +4705,8 @@ public sealed class Session
 
         return await StepIntoDynamicAsync(
             caller, unit, specification, new[] { statementExpression }, requireNVarchar: true,
-            paramsArg?.ParameterValue, userArgs, "sp_executesql", messages, cancellationToken)
+            paramsArg?.ParameterValue, userArgs, "sp_executesql", captureInsert, propagateCapture,
+            messages, cancellationToken)
             .ConfigureAwait(false);
 
         static bool IsPrefixOf(string candidate, string formal)
@@ -4740,6 +4723,7 @@ public sealed class Session
         Frame caller, Interpreter.StatementUnit unit, ExecuteSpecification specification,
         IEnumerable<ScalarExpression> statementParts, bool requireNVarchar,
         ScalarExpression? paramsExpression, IList<ExecuteParameter> actuals, string displayName,
+        InsertStatement? captureInsert, bool propagateCapture,
         List<string> messages, CancellationToken cancellationToken)
     {
         // The provably-nvarchar gate (sp_executesql only): a varchar @statement is engine msg 214.
@@ -4825,6 +4809,50 @@ public sealed class Session
             return null;
         }
 
+        // C11 (A68, §11.7): dynamic-source capture. A dynamic frame is a §11 frame like any other, and
+        // the capture machinery keys purely on the frame's CaptureTargetSql/CaptureFlushSql (never on
+        // procedure-vs-dynamic), so a dynamic batch can be a capture OWNER (`INSERT #t EXEC(@sql)` /
+        // `sp_executesql` — captureInsert set) or a PROPAGATING child (a dynamic call stepped into while
+        // an ancestor is capturing — propagateCapture). Native buffers a dynamic source's — and a nested
+        // dynamic child's — result stream into the target identically to a procedure (engine fact 36a/d).
+        // The two roles are mutually exclusive here: the 8164 tripwire in StepIntoAsync returns before a
+        // dynamic branch can carry BOTH, so captureInsert and propagateCapture are never both set.
+        if (captureInsert is not null || propagateCapture)
+        {
+            // The scanner cannot cross an EXEC boundary, so the just-parsed dynamic body is re-scanned at
+            // its own push (A67 precedent). A nested INSERT…EXEC inside the dynamic text is native msg
+            // 8164 (fact 36e); a CTE-headed result SELECT / txn control / streaming OUTPUT / bare FETCH
+            // cannot be captured faithfully — refuse → step-over, where native performs the capture as one
+            // batch (raising its own 8164 for the nested case). LOAD-BEARING (Fable A68 review): the
+            // step-over stays faithful only because a stepped-over dynamic call in a capture frame is
+            // result-returning (ResultCaptureClassifier treats an ExecuteStatement as such), so it
+            // composes `INSERT INTO <stage> EXEC(…)` — a real native INSERT…EXEC that captures the child's
+            // rows / raises the real 8164. Were the classifier to stop treating a stepped-over EXEC as
+            // result-returning, this refusal would leak the child's rows to the client — keep them in sync.
+            if (CaptureSafetyScanner.FindUncapturableStatement(batches[0]) is { } uncapturable)
+            {
+                messages.Add($"Cannot step into this capture: {displayName} contains {uncapturable} — stepping over (C11, §11.7).");
+                return null;
+            }
+        }
+
+        CaptureStagePlan? captureStage = null;
+        if (captureInsert is not null)
+        {
+            // §11.7 (A65): the OWNER dynamic frame gets its own stage, derived from the target exactly as
+            // a procedure owner does (ResolveCaptureStageAsync is source-agnostic — it reads only the
+            // INSERT target). A refusal steps the whole capture OVER — native performs it as one batch.
+            var resolution = await ResolveCaptureStageAsync(
+                captureInsert, caller, _frames!.PeekNextOrdinal(), cancellationToken).ConfigureAwait(false);
+            if (resolution.RefusalReason is { } reason)
+            {
+                messages.Add($"Cannot step into this INSERT … EXEC: {reason} — stepping over (C11, §11.7).");
+                return null;
+            }
+
+            captureStage = resolution.Plan;
+        }
+
         var plan = new CalleePlan(
             displayName,
             dynamicText,
@@ -4838,7 +4866,12 @@ public sealed class Session
             FrameKind.Script,
             batches[0],
             formals,
-            actuals);
+            actuals,
+            captureStage,
+            // C11 (A68): a PROPAGATING dynamic child inherits the ancestor stage insert ref (redirects
+            // into the same shared stage) but owns no stage — null unless propagating. Mutually
+            // exclusive with captureStage (the 8164 tripwire guarantees never both).
+            InheritedCaptureTargetSql: propagateCapture ? caller.CaptureTargetSql : null);
 
         return await PushCalleeFrameAsync(plan, caller, unit, specification, messages, cancellationToken)
             .ConfigureAwait(false);
