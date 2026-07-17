@@ -4302,7 +4302,10 @@ public sealed class Session
         IList<TSqlStatement> Body,
         IReadOnlyList<CalleeParameter> Formals,
         IList<ExecuteParameter> Actuals,
-        CaptureStagePlan? CaptureStage = null);              // C11 (A65): INSERT…EXEC capture staging plan, or null
+        CaptureStagePlan? CaptureStage = null,               // C11 (A65): INSERT…EXEC capture staging plan, or null
+        string? InheritedCaptureTargetSql = null);          // C11 (A67): a nested step-into that PROPAGATES an
+                                                             // ancestor capture — the stage insert ref it inherits
+                                                             // (no CaptureStage of its own; it owns/flushes nothing)
 
     // §11.1 (A58/A64): a step-into candidate is a plain `EXEC proc` (SubKind.Execute) or an
     // `INSERT <target> EXEC proc` (an InsertStatement whose source is an ExecuteInsertSource — C11).
@@ -4413,12 +4416,31 @@ public sealed class Session
                 return null;
         }
 
-        // C11 (A64) MVP: a nested step-into INSIDE an INSERT…EXEC capture is step-over — the nested
-        // call's result stream is captured by the wrapping INSERT…EXEC composition of THIS frame
-        // instead (no capture propagation into child frames in this milestone).
-        if (caller.CaptureTargetSql is not null)
+        // C11 (A67, §11.7): a nested step-into INSIDE an INSERT…EXEC capture PROPAGATES the capture —
+        // native buffers the whole callee subtree's result stream into the one target (engine fact
+        // 35a), so a nested plain `EXEC proc` stepped into must land its result-returning statements
+        // in the SAME stage. propagateCapture threads the ancestor's stage insert ref down to the
+        // child frame below (which becomes a redirect-only, non-owning capture frame: it inherits
+        // CaptureTargetSql but no CaptureFlushSql, so it never creates/drops/flushes a stage). The
+        // refused sub-cases (dynamic child, nested INSERT…EXEC, unsafe child body) still step OVER
+        // where native captures as one batch — handled at each guard below.
+        var propagateCapture = caller.CaptureTargetSql is not null;
+
+        // A nested INSERT…EXEC while already capturing (native msg 8164, "cannot be nested"): this is a
+        // SHOULD-NEVER-FIRE tripwire, not a live path — to be a capture frame whose cursor sits on an
+        // INSERT…EXEC, the ancestor's own body would have had to contain one, which CaptureSafetyScanner
+        // (fact 35c) already refused at that ancestor's push. It exists ONLY to preserve the
+        // capture-role invariant (never build a plan with BOTH CaptureStage and InheritedCaptureTargetSql
+        // — which would make the child a second, independent OWNER and try to genuinely nest an
+        // INSERT…EXEC). NOTE the step-over fallback is graceful degradation, NOT native fidelity: a
+        // stepped-over INSERT…EXEC in a capture frame classifies non-result-returning
+        // (ResultCaptureClassifier), so it composes UNWRAPPED and — the outer capture being flattened,
+        // not a live native INSERT…EXEC — would silently SUCCEED rather than raise 8164. That is only
+        // acceptable because the branch is unreachable; if a future scanner change opened it, this must
+        // become a hard planner-bug throw (cf. the InvalidOperationException tripwires elsewhere).
+        if (propagateCapture && captureInsert is not null)
         {
-            messages.Add("Stepping into a nested call inside an INSERT … EXEC capture is step-over in this milestone — stepping over (C11).");
+            messages.Add("A nested INSERT … EXEC inside an INSERT … EXEC capture is native msg 8164 — stepping over (C11, §11.7).");
             return null;
         }
 
@@ -4458,6 +4480,15 @@ public sealed class Session
             if (captureInsert is not null)
             {
                 messages.Add("INSERT … EXEC(@sql) (dynamic source) is step-over in this milestone — stepping over (C11).");
+                return null;
+            }
+
+            // C11 (A67, §11.7): a dynamic child inside a capture cannot propagate — its dynamic body
+            // is not redirected, so it would stream to the client instead of the stage (dynamic-source
+            // capture is a separate unbuilt item). Step OVER, where native captures it as one batch.
+            if (propagateCapture)
+            {
+                messages.Add("Stepping into EXEC(@sql) inside an INSERT … EXEC capture is step-over (dynamic-source capture is unbuilt) — stepping over (C11, §11.7).");
                 return null;
             }
 
@@ -4512,6 +4543,14 @@ public sealed class Session
                 return null;
             }
 
+            // C11 (A67, §11.7): as with EXEC(@sql), a dynamic sp_executesql child cannot propagate a
+            // capture — step OVER (native captures it as one batch).
+            if (propagateCapture)
+            {
+                messages.Add("Stepping into sp_executesql inside an INSERT … EXEC capture is step-over (dynamic-source capture is unbuilt) — stepping over (C11, §11.7).");
+                return null;
+            }
+
             return await StepIntoSpExecuteSqlAsync(
                 caller, unit, specification, procedureEntity, messages, cancellationToken).ConfigureAwait(false);
         }
@@ -4540,15 +4579,18 @@ public sealed class Session
 
         var procedureBody = FrameBodyResolver.ResolveProcedureBody(parsed);
 
-        // C11 (A64): capture works by prefixing each result-returning callee statement with
+        // C11 (A64/A67): capture works by prefixing each result-returning callee statement with
         // `INSERT INTO <target> `. A few statement shapes cannot be captured faithfully that way (a
         // CTE-headed SELECT can't be prefixed; a callee ROLLBACK/nested INSERT…EXEC/streaming-OUTPUT
         // DML/bare FETCH would lose rows or corrupt state). Their presence anywhere in the body refuses
-        // step-into → faithful native step-over (the engine performs the capture as one batch).
-        if (captureInsert is not null
+        // step-into → faithful native step-over (the engine performs the capture as one batch). The
+        // SAME scan runs whether this is the top-level capture callee (captureInsert) or a nested
+        // step-into that PROPAGATES an ancestor capture (propagateCapture) — the scanner cannot cross
+        // an EXEC boundary, so each newly-entered capturing body is re-scanned at its own push (A67).
+        if ((captureInsert is not null || propagateCapture)
             && CaptureSafetyScanner.FindUncapturableStatement(procedureBody) is { } uncapturable)
         {
-            messages.Add($"Cannot step into this INSERT … EXEC: '{nameText}' contains {uncapturable} — stepping over (C11, §11.7).");
+            messages.Add($"Cannot step into this capture: '{nameText}' contains {uncapturable} — stepping over (C11, §11.7).");
             return null;
         }
 
@@ -4577,7 +4619,11 @@ public sealed class Session
             procedureBody,
             ExtractCalleeParameters(parsed, blueprint.Definition),
             procedureEntity.Parameters,
-            captureStage);
+            captureStage,
+            // C11 (A67): a propagating child owns no stage of its own — it inherits the ancestor
+            // capture frame's stage insert reference so its result-returning statements redirect into
+            // the SAME stage (the owner flushes it at ITS completed pop). Null unless propagating.
+            InheritedCaptureTargetSql: propagateCapture ? caller.CaptureTargetSql : null);
 
         return await PushCalleeFrameAsync(plan, caller, unit, specification, messages, cancellationToken)
             .ConfigureAwait(false);
@@ -5157,7 +5203,11 @@ public sealed class Session
             XactAbortOn = caller.XactAbortOn,
             // C11 (A65): a stepped-into INSERT…EXEC callee BUFFERS its result stream in a per-frame
             // stage; the fields are set below once the stage table exists (server-side push).
-            CaptureTargetSql = plan.CaptureStage?.StageInsertTarget,
+            // C11 (A67): a PROPAGATING child inherits the ancestor's stage insert ref (so it redirects
+            // into the same stage) but is NOT a stage owner — CaptureFlushSql stays null and
+            // CaptureTargetHasIdentity false, so it creates/drops/flushes nothing. Exactly one of
+            // CaptureStage (owner) / InheritedCaptureTargetSql (child) is set (never both).
+            CaptureTargetSql = plan.CaptureStage?.StageInsertTarget ?? plan.InheritedCaptureTargetSql,
             CaptureFlushSql = plan.CaptureStage?.FlushCoreSql,
             CaptureTargetHasIdentity = plan.CaptureStage?.TargetHasIdentity ?? false,
         };
