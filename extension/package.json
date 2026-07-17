@@ -2,7 +2,7 @@
   "name": "tsql-step-debugger",
   "displayName": "T-SQL Step Debugger",
   "description": "Client-side, interpreter-driven step debugger for T-SQL / MSSQL (SQL Server) stored procedures, functions, and scripts — no engine-side debug support required.",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "preview": true,
   "publisher": "ibaxo",
   "license": "MIT",
