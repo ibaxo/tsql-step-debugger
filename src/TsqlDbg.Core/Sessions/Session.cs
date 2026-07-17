@@ -4122,30 +4122,67 @@ public sealed class Session
         // site. An ABNORMAL pop discards the stage un-materialized — the target is left EMPTY,
         // matching native's buffer-then-materialize atomicity (I7).
         //
-        // F2 (Fable §10 review): a capture callee can DOOM (XACT_ABORT ON + a caught error) and still
-        // reach a completed pop. Native `INSERT … EXEC` into a doomed transaction raises 3930 (routed
-        // to a caller CATCH, target empty). The debugger cannot route that faithfully from inside a
-        // pop — routing re-entrantly, and again from the doomed→detached step-loop transition,
-        // corrupts frame/error-context state — and the session is already doomed (its only faithful
-        // exits are ROLLBACK or teardown, §10.4). So a doomed capture completion TERMINATES at the
-        // call site: honest (NEVER the pre-fix silent success), at the cost of not routing 3930 into a
-        // caller CATCH the way native does — the C11 doomed-capture residual (§11.7). A HEALTHY flush
-        // materializes and any fault (515/547/2627) is DEFERRED-routed (FlushCaptureAsync, deferRoute).
+        // F2 (Fable §10 review, re-reviewed 2026-07-17): a capture callee can DOOM (XACT_ABORT ON + a
+        // caught error) and still reach a completed pop. Native `INSERT … EXEC` into a doomed
+        // transaction raises 3930 (routed to a caller CATCH, target empty). The debugger does NOT route
+        // that — it TERMINATES honestly at the call site — for THREE load-bearing reasons (not merely
+        // "re-entrant routing is awkward"; the re-review confirmed the deferRoute pipeline could
+        // MECHANICALLY pend a 3930, so the real justification is fidelity, not plumbing):
+        //   1. The fact-22 forced rollback already DESTROYED the stage #temp (and any caller #temp /
+        //      table-var target realization) the instant the callee doomed (§10.4/D8; doomed
+        //      re-creation is forbidden). A real flush attempt therefore raises 208 (missing object) —
+        //      wrong number AND wrong class (208 is §10.1 same-scope-UNcatchable; native 3930 IS
+        //      same-scope-catchable). No honest engine statement yields a real 3930 here.
+        //   2. Routing would thus require SIMULATING a 3930 into debuggee CATCH control flow — the
+        //      caller's R7-rewritten ERROR_NUMBER()/ERROR_MESSAGE() would serve values no server
+        //      produced. That violates the §10.4/A14 "no engine errors are simulated" doctrine (the
+        //      same doctrine C23 honors by surfacing a real-but-different error over a simulated one).
+        //   3. The doomed pop skips OUTPUT copy-back (the `if (!_doomed)` gate above); a routed CATCH
+        //      would read UNVERIFIED pre-call OUTPUT state (native's doomed-INSERT…EXEC OUTPUT
+        //      semantics are not live-verified).
+        // So terminal is honest (NEVER the pre-fix silent success) and, on this doctrine, strictly
+        // better than routing — at the cost of not delivering 3930 into a caller CATCH (the C11
+        // doomed-capture residual, §11.7). §10.3/A35 STILL applies: doomed-unhandled is BATCH-terminal,
+        // so in multi-batch script mode with more batches remaining this arms _pendingBatchAdvance (the
+        // next step force-rolls at the GO boundary and runs the next batch, fact 32a) rather than
+        // bricking the session; only the last batch / single-batch script / procedure mode is
+        // connection-fatal. A HEALTHY flush materializes and any fault (515/547/2627) is DEFERRED-routed
+        // (FlushCaptureAsync, deferRoute).
         StepOutcome? flushOutcome = null;
         if (captureFlushSql is not null)
         {
             if (completed && _doomed)
             {
-                _broken = true;
-                messages.Add(
-                    "The INSERT … EXEC could not materialize its captured rows: the transaction is doomed " +
-                    "(uncommittable) — natively this is error 3930 and the target stays empty. The debugger " +
-                    "terminates the run here (the doomed session's exits are ROLLBACK or teardown, §10.4/§11.7); " +
-                    "step OVER the INSERT … EXEC for native's caller-CATCH behavior.");
                 flushOutcome = new StepOutcome(StepDisposition.FrameFaulted,
                     new ErrorContextValues(3930, 16, 1, callSite.CallUnit.Span.StartLine, null,
                         "The current transaction cannot be committed and the INSERT … EXEC cannot materialize its " +
                         "captured rows. Roll back the transaction. (§11.7 doomed capture.)"));
+
+                // §10.3/A35: doomed-unhandled is BATCH-terminal, not connection-fatal. With more
+                // batches remaining, native force-rolls at the GO boundary and runs the next batch
+                // (fact 32a): publish the fault-site stop (FrameFaulted) and arm _pendingBatchAdvance
+                // so the next step crosses via AdvanceToNextBatch (which runs the §8.1 doom rollback +
+                // aborted callee pops). The last batch / single-batch script / procedure mode
+                // (MoreBatchesRemain always false there) stays connection-fatal.
+                if (MoreBatchesRemain)
+                {
+                    _pendingBatchAdvance = true;
+                    messages.Add(
+                        "The INSERT … EXEC could not materialize its captured rows: the transaction is doomed " +
+                        "(uncommittable) — natively this is error 3930 and the target stays empty. Batch " +
+                        $"{_currentBatchIndex + 1} of {_batches!.Count} is terminated (§10.3/§11.7 batch-aborting " +
+                        "class); execution continues at the next batch. Step OVER the INSERT … EXEC for native's " +
+                        "caller-CATCH behavior.");
+                }
+                else
+                {
+                    _broken = true;
+                    messages.Add(
+                        "The INSERT … EXEC could not materialize its captured rows: the transaction is doomed " +
+                        "(uncommittable) — natively this is error 3930 and the target stays empty. The debugger " +
+                        "terminates the run here (the doomed session's exits are ROLLBACK or teardown, §10.4/§11.7); " +
+                        "step OVER the INSERT … EXEC for native's caller-CATCH behavior.");
+                }
             }
             else if (completed)
             {

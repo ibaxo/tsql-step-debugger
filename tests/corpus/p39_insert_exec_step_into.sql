@@ -188,3 +188,39 @@ BEGIN
     END CATCH
     SELECT COUNT(*) AS n FROM #t;                       -- 0 (atomic — no partial rows)
 END
+GO
+-- F2 (A65 §10 re-review 2026-07-17): a capture callee that DOOMS its own transaction yet reaches a
+-- COMPLETED pop. `SET XACT_ABORT ON` makes the divide-by-zero doom the transaction; the callee's own
+-- TRY/CATCH swallows it so the module runs to its end (a COMPLETED pop) while the tran is uncommittable.
+-- Native `INSERT … EXEC` would raise 3930 here (routed to a caller CATCH, target empty); the debugger
+-- CANNOT obtain a real 3930 (the fact-22 rollback already destroyed the stage) and refuses to SIMULATE
+-- one (§10.4/A14), so a doomed capture-completion TERMINATES the run at the call site (§11.7 residual e).
+-- This fixture pins that terminal — the F2 fix's whole point is that it is NEVER a silent success. It is
+-- asserted on the DEBUGGER'S OWN behavior (a thrown terminal), not by native fidelity comparison: the
+-- debugger terminates where native routes-to-CATCH, so the two DIVERGE by design (why the doom procs
+-- were left out of the fidelity harness).
+CREATE OR ALTER PROCEDURE dbo.p39_doomcap_callee
+    @Seed int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;                                  -- an error now DOOMS the transaction
+    DECLARE @z int;
+    SELECT @Seed AS v;                                  -- captured (buffered into the stage)
+    BEGIN TRY
+        SET @z = @Seed / 0;                             -- divide-by-zero → doomed under XACT_ABORT ON
+    END TRY
+    BEGIN CATCH
+        SET @z = -1;                                    -- swallow: run on to a COMPLETED pop while doomed
+    END CATCH
+END
+GO
+CREATE OR ALTER PROCEDURE dbo.p39_doomcap_caller
+    @Seed int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    CREATE TABLE #t (v int);
+    INSERT INTO #t (v) EXEC dbo.p39_doomcap_callee @Seed = @Seed;
+    SELECT v FROM #t ORDER BY v;                        -- never reached: the doomed capture terminates
+END
