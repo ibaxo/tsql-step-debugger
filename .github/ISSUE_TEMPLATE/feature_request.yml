@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an improvement or new capability for the T-SQL step debugger
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! A couple of sentences on the problem you're trying to solve
+        helps much more than a solution alone.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation where the debugger falls short for you today.
+      placeholder: "When I debug a procedure that ... , I can't ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to happen?
+      description: Describe the behavior or feature you'd like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example T-SQL (optional)
+      description: If the request is about specific T-SQL constructs, a small example helps a lot.
+      render: sql
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds or alternatives you've considered (optional)
+    validations:
+      required: false

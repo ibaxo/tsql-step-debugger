@@ -1,0 +1,95 @@
+name: Bug report
+description: Something in the T-SQL step debugger doesn't work as expected
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in the sections below —
+        issues without repro steps or a description of what went wrong usually can't be acted on.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, and what went wrong? Include the exact error message if there was one.
+      placeholder: "I pressed F5 on my script and stepping stopped at line 12 with the message ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      placeholder: "I expected the debugger to step onto the next statement."
+    validations:
+      required: true
+  - type: textarea
+    id: repro-sql
+    attributes:
+      label: Minimal T-SQL to reproduce
+      description: >
+        The smallest script or procedure that shows the problem, including any table/temp-table
+        setup it needs. Please remove anything confidential.
+      render: sql
+      placeholder: |
+        CREATE TABLE #t (id int);
+        INSERT INTO #t VALUES (1);
+        SELECT * FROM #t;
+    validations:
+      required: true
+  - type: textarea
+    id: repro-steps
+    attributes:
+      label: Steps to reproduce
+      description: How you ran it in the debugger (breakpoints set, step-into vs step-over, etc.).
+      placeholder: |
+        1. Open the script above in VS Code
+        2. Press F5 (Debug T-SQL Script)
+        3. Step over the INSERT
+        4. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: debug-mode
+    attributes:
+      label: Debug mode
+      options:
+        - Script (F5 / Debug T-SQL Script button)
+        - Stored procedure (launch.json)
+        - MCP server
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: extension-version
+    attributes:
+      label: Extension version
+      placeholder: "0.0.19"
+    validations:
+      required: true
+  - type: input
+    id: sql-server-version
+    attributes:
+      label: SQL Server version
+      description: Run `SELECT @@VERSION` against the target server.
+      placeholder: "SQL Server 2022 (16.0.x)"
+    validations:
+      required: true
+  - type: input
+    id: vscode-version
+    attributes:
+      label: VS Code version and OS
+      placeholder: "VS Code 1.9x on Windows 11"
+    validations:
+      required: true
+  - type: textarea
+    id: trace
+    attributes:
+      label: Adapter trace (optional but very helpful)
+      description: >
+        Set `"trace"` in your launch configuration to a file path, reproduce the problem,
+        and attach or paste the relevant part of the trace file here. Please check it for
+        anything confidential before posting — it contains your statements and variable values.
+      render: text
+    validations:
+      required: false
