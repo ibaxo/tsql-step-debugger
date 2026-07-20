@@ -52,6 +52,13 @@ export function activate(context: vscode.ExtensionContext): void {
 			// pops a Save As dialog. Suppress it; a saved-but-dirty file is read from the live buffer too.
 			}, { suppressSaveBeforeStart: true });
 		}),
+		// "T-SQL File" in File → New File… (file/newFile menu). Opens an untitled buffer with the
+		// sql language already set, so the ▷ Debug button, breakpoints, and F5 work immediately —
+		// combined with A60 the file never needs to touch disk.
+		vscode.commands.registerCommand('tsqldbg.newSqlFile', async () => {
+			const doc = await vscode.workspace.openTextDocument({ language: 'sql' });
+			await vscode.window.showTextDocument(doc);
+		}),
 		vscode.commands.registerCommand('tsqldbg.connections.manage', async () => {
 			await store.manage();
 			connectionStatus.refreshIdle();

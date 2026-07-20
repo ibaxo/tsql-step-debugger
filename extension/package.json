@@ -112,6 +112,12 @@
         "icon": "$(debug-alt)"
       },
       {
+        "command": "tsqldbg.newSqlFile",
+        "title": "New T-SQL File",
+        "shortTitle": "T-SQL File",
+        "category": "T-SQL Debug"
+      },
+      {
         "command": "tsqldbg.connections.manage",
         "title": "Manage Connections",
         "category": "T-SQL Debug"
@@ -123,6 +129,12 @@
       }
     ],
     "menus": {
+      "file/newFile": [
+        {
+          "command": "tsqldbg.newSqlFile",
+          "group": "file"
+        }
+      ],
       "editor/title/run": [
         {
           "command": "tsqldbg.debugEditorScript",

@@ -43,6 +43,8 @@ Set a breakpoint in a `.sql` file, press **F5**, and step.
 
 The file **doesn't even have to be saved**: open a fresh untitled buffer, type some T-SQL, and
 press F5 — the exact text on screen is debugged in place, nothing is written to disk.
+**File → New File… → T-SQL File** gives you such a buffer with SQL syntax highlighting,
+breakpoints, and the ▷ button already active.
 
 ## Features
 
