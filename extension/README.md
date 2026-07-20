@@ -123,34 +123,37 @@ connection.)*
 The **▷ Debug T-SQL Script** button and **F5** both debug the active `.sql` file with no
 `launch.json` at all — script mode is the default, and the file doesn't have to be saved. Add a
 `launch.json` entry only when you want to tweak an option; *Run and Debug → create a launch.json
-file* generates exactly this, which behaves identically to the button.
+file* generates the uncommented lines of exactly this, which behaves identically to the button.
 
 <details>
 <summary>Full <code>launch.json</code> for script mode (every option at its default)</summary>
 
-```json
+```jsonc
 {
   "type": "tsql",
   "request": "launch",
   "name": "Debug T-SQL script",
   "mode": "script",
   "script": "${file}",
-  "stopOnEntry": true,
   "commitMode": "rollback",
-  "waitfor": "skip",
-  "boost": false,
   "allowConsoleWrites": true,
   "executeAs": null,
   "compatLevel": 0,
-  "logLevel": "normal",
   "sourceMap": [],
   "commandTimeoutSec": 300,
   "consoleTimeoutSec": 30,
-  "maxConsoleRows": 200,
-  "tempTablePageSize": 50,
-  "displayValueChars": 256,
-  "watchBudgetMs": 2000,
   "trace": false
+  // The options below take their default from VS Code Settings (tsqlDbg.defaults.<option>)
+  // while omitted. Uncomment one only to pin it for this config — an explicit value here
+  // always beats your Settings.
+  // "stopOnEntry": true,
+  // "waitfor": "skip",
+  // "boost": false,
+  // "logLevel": "normal",
+  // "maxConsoleRows": 200,
+  // "tempTablePageSize": 50,
+  // "displayValueChars": 256,
+  // "watchBudgetMs": 2000
 }
 ```
 </details>
@@ -169,7 +172,7 @@ To debug a **deployed procedure** instead of a script, add a `launch.json` entry
 <details>
 <summary>Full <code>launch.json</code> for procedure mode (every option at its default)</summary>
 
-```json
+```jsonc
 {
   "type": "tsql",
   "request": "launch",
@@ -177,22 +180,25 @@ To debug a **deployed procedure** instead of a script, add a `launch.json` entry
   "mode": "procedure",
   "procedure": "dbo.MyProcedure",
   "args": { "@OrderId": "42", "@Mode": "N'FULL'" },
-  "stopOnEntry": true,
   "commitMode": "rollback",
-  "waitfor": "skip",
-  "boost": false,
   "allowConsoleWrites": true,
   "executeAs": null,
   "compatLevel": 0,
-  "logLevel": "normal",
   "sourceMap": [],
   "commandTimeoutSec": 300,
   "consoleTimeoutSec": 30,
-  "maxConsoleRows": 200,
-  "tempTablePageSize": 50,
-  "displayValueChars": 256,
-  "watchBudgetMs": 2000,
   "trace": false
+  // The options below take their default from VS Code Settings (tsqlDbg.defaults.<option>)
+  // while omitted. Uncomment one only to pin it for this config — an explicit value here
+  // always beats your Settings.
+  // "stopOnEntry": true,
+  // "waitfor": "skip",
+  // "boost": false,
+  // "logLevel": "normal",
+  // "maxConsoleRows": 200,
+  // "tempTablePageSize": 50,
+  // "displayValueChars": 256,
+  // "watchBudgetMs": 2000
 }
 ```
 </details>
@@ -207,6 +213,14 @@ Connection Manager here too.
 Everything goes in a `launch.json` entry (`"type": "tsql"`). Only `mode` (and `procedure`
 for procedure mode) really matters; the rest have sensible defaults.
 
+**Don't want a `launch.json` at all?** The options marked * below can be set globally in VS
+Code **Settings** (search for "tsqlDbg defaults", or edit `tsqlDbg.defaults.*` in
+`settings.json`). A settings value is your personal default — it applies whenever a launch
+config (including plain F5 with no `launch.json`) doesn't set that option; an explicit
+`launch.json` value always wins. `commitMode` and `allowConsoleWrites` are deliberately not
+available as settings, so a forgotten global default can never change what a session commits
+to your database.
+
 <details>
 <summary>All launch options</summary>
 
@@ -218,25 +232,25 @@ for procedure mode) really matters; the rest have sensible defaults.
 | `scriptText` | string | — | Inline script body, run verbatim with no file read. Set automatically for unsaved/dirty buffers — you normally never write this by hand. |
 | `procedure` | string | — | Two/three-part name; required for `mode: procedure`. |
 | `args` | object | `{}` | Parameter → T-SQL literal, e.g. `{ "@Id": "42" }` (procedure mode). |
-| `stopOnEntry` | boolean | `true` | Stop at the first statement before running. |
+| `stopOnEntry` * | boolean | `true` | Stop at the first statement before running. |
 | `commitMode` | `rollback` \| `commit` | `rollback` | `commit` keeps changes after a confirmed Stop. |
 | `authType` | `integrated` \| `sql` | `integrated` | Windows (SSPI) or a SQL login. Best set in the Connection Manager. |
 | `sqlUser` | string | — | SQL login name (when `authType: sql`). The **password is never a config field** — it lives in SecretStorage; set it in the Connection Manager. |
 | `encrypt` / `options` | boolean / string | `false` / — | `encrypt` = `Encrypt=Mandatory`; `options` appends a raw connection-string fragment. |
 | `targetsFile` | string | *(`MSSQL_DEBUG_TARGETS`, else `${workspaceFolder}/targets.json`)* | Optional per-server metadata (`env`, connection `options`). |
-| `boost` | boolean | `false` | Run whole `IF`/`WHILE` blocks as one batch under Continue (faster, less granular). |
-| `waitfor` | `skip` \| `honor` | `skip` | `skip` logs `WAITFOR DELAY/TIME` instead of blocking. |
+| `boost` * | boolean | `false` | Run whole `IF`/`WHILE` blocks as one batch under Continue (faster, less granular). |
+| `waitfor` * | `skip` \| `honor` | `skip` | `skip` logs `WAITFOR DELAY/TIME` instead of blocking. |
 | `allowConsoleWrites` | boolean | `true` | Let the Debug Console write (DML/DDL/`SET @x`), not just `SELECT`. |
 | `sourceMap` | string[] | — | Globs binding a module's server definition to your real `.sql` files (breakpoints in called procs). |
 | `executeAs` | string | — | `EXECUTE AS <clause>` at start, `REVERT`ed at end. |
 | `compatLevel` | `0` \| `150` \| `160` \| `170` | `0` | ScriptDom parser version. `0` = auto-detect from the server (SQL 2019 → `150`, 2022 → `160`, 2025 → `170`). |
-| `logLevel` | `normal` \| `verbose` | `normal` | `verbose` also shows the debugger's own diagnostic notes (NOCOUNT, `GO`-batch, trigger heads-ups). |
+| `logLevel` * | `normal` \| `verbose` | `normal` | `verbose` also shows the debugger's own diagnostic notes (NOCOUNT, `GO`-batch, trigger heads-ups). |
 | `commandTimeoutSec` | number | `300` | Per-statement timeout. |
 | `consoleTimeoutSec` | number | `30` | Debug Console timeout. |
-| `maxConsoleRows` | number | `200` | Debug Console row cap. |
-| `tempTablePageSize` | number | `50` | Rows per page in Temp Tables. |
-| `displayValueChars` | number | `256` | Max characters shown per value. |
-| `watchBudgetMs` | number | `2000` | Per-stop budget for evaluating Watch expressions. |
+| `maxConsoleRows` * | number | `200` | Debug Console row cap. |
+| `tempTablePageSize` * | number | `50` | Rows per page in Temp Tables. |
+| `displayValueChars` * | number | `256` | Max characters shown per value. |
+| `watchBudgetMs` * | number | `2000` | Per-stop budget for evaluating Watch expressions. |
 | `trace` | boolean | `false` | Write a full adapter log (for diagnosing the debugger itself). |
 
 </details>
@@ -245,6 +259,7 @@ for procedure mode) really matters; the rest have sensible defaults.
 
 | Setting | Default | Description |
 |---|---|---|
+| `tsqlDbg.defaults.*` | *(unset)* | Personal defaults for the launch options marked * above (`stopOnEntry`, `waitfor`, `boost`, `maxConsoleRows`, `tempTablePageSize`, `displayValueChars`, `watchBudgetMs`, `logLevel`). Applied when a launch config doesn't set the option; `launch.json` always wins. |
 | `tsqlDbg.mssql.useActiveEditorConnection` | `true` | Auto-use the active `.sql` file's mssql connection when set. |
 | `tsqlDbg.mssql.useConnectionPicker` | `true` | At launch, open mssql's own connection picker first. Set `false` to lead with the debugger's Connection Manager, with mssql as a secondary entry. |
 | `tsqlDbg.adapterPath` | — | Dev override: absolute path to a locally-built `TsqlDbg.Adapter`. |

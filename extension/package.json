@@ -2,7 +2,7 @@
   "name": "tsql-step-debugger",
   "displayName": "T-SQL Step Debugger",
   "description": "Client-side, interpreter-driven step debugger for T-SQL / MSSQL (SQL Server) stored procedures, functions, and scripts — no engine-side debug support required.",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "preview": true,
   "publisher": "ibaxo",
   "license": "MIT",
@@ -43,6 +43,54 @@
           "type": "string",
           "default": null,
           "description": "Dev override: absolute path to a locally-built TsqlDbg.Adapter executable, instead of the one bundled with this extension."
+        },
+        "tsqlDbg.defaults.stopOnEntry": {
+          "type": "boolean",
+          "default": true,
+          "description": "Default for the 'stopOnEntry' launch option when your launch config (or plain F5 with no launch.json) doesn't set it: stop at frame 0's first statement before running anything. An explicit launch.json value always wins."
+        },
+        "tsqlDbg.defaults.waitfor": {
+          "type": "string",
+          "enum": [
+            "skip",
+            "honor"
+          ],
+          "default": "skip",
+          "description": "Default for the 'waitfor' launch option: 'skip' intercepts and logs WAITFOR DELAY/TIME instead of sending it; 'honor' sends it as-is (the session genuinely blocks). An explicit launch.json value always wins."
+        },
+        "tsqlDbg.defaults.boost": {
+          "type": "boolean",
+          "default": false,
+          "description": "Default for the 'boost' launch option: execute whole IF/WHILE subtrees as one composed batch under Continue, instead of interpreting statement by statement. An explicit launch.json value always wins."
+        },
+        "tsqlDbg.defaults.maxConsoleRows": {
+          "type": "number",
+          "default": 200,
+          "description": "Default for the 'maxConsoleRows' launch option: row cap for Debug Console result-set rendering. An explicit launch.json value always wins."
+        },
+        "tsqlDbg.defaults.tempTablePageSize": {
+          "type": "number",
+          "default": 50,
+          "description": "Default for the 'tempTablePageSize' launch option: rows per page when browsing the Temp Tables scope. An explicit launch.json value always wins."
+        },
+        "tsqlDbg.defaults.displayValueChars": {
+          "type": "number",
+          "default": 256,
+          "description": "Default for the 'displayValueChars' launch option: max characters shown per variable/cell value before truncation. An explicit launch.json value always wins."
+        },
+        "tsqlDbg.defaults.watchBudgetMs": {
+          "type": "number",
+          "default": 2000,
+          "description": "Default for the 'watchBudgetMs' launch option: shared per-stop time budget for evaluating watch expressions before remaining ones show a click-to-evaluate placeholder. An explicit launch.json value always wins."
+        },
+        "tsqlDbg.defaults.logLevel": {
+          "type": "string",
+          "enum": [
+            "normal",
+            "verbose"
+          ],
+          "default": "normal",
+          "description": "Default for the 'logLevel' launch option: 'normal' shows your script's output, errors, logpoints, and commit/rollback notices; 'verbose' additionally shows the debugger's own diagnostic annotations. An explicit launch.json value always wins."
         },
         "tsqlDbg.mssql.useActiveEditorConnection": {
           "type": "boolean",
@@ -281,21 +329,13 @@
             "name": "Debug T-SQL script",
             "mode": "script",
             "script": "${file}",
-            "stopOnEntry": true,
             "commitMode": "rollback",
-            "waitfor": "skip",
-            "boost": false,
             "allowConsoleWrites": true,
             "executeAs": null,
             "compatLevel": 0,
-            "logLevel": "normal",
             "sourceMap": [],
             "commandTimeoutSec": 300,
             "consoleTimeoutSec": 30,
-            "maxConsoleRows": 200,
-            "tempTablePageSize": 50,
-            "displayValueChars": 256,
-            "watchBudgetMs": 2000,
             "trace": false
           }
         ],
@@ -309,21 +349,13 @@
               "name": "Debug T-SQL script",
               "mode": "script",
               "script": "^\"\\${file}\"",
-              "stopOnEntry": true,
               "commitMode": "rollback",
-              "waitfor": "skip",
-              "boost": false,
               "allowConsoleWrites": true,
               "executeAs": null,
               "compatLevel": 0,
-              "logLevel": "normal",
               "sourceMap": [],
               "commandTimeoutSec": 300,
               "consoleTimeoutSec": 30,
-              "maxConsoleRows": 200,
-              "tempTablePageSize": 50,
-              "displayValueChars": 256,
-              "watchBudgetMs": 2000,
               "trace": false
             }
           },
@@ -337,21 +369,13 @@
               "mode": "procedure",
               "procedure": "dbo.MyProcedure",
               "args": {},
-              "stopOnEntry": true,
               "commitMode": "rollback",
-              "waitfor": "skip",
-              "boost": false,
               "allowConsoleWrites": true,
               "executeAs": null,
               "compatLevel": 0,
-              "logLevel": "normal",
               "sourceMap": [],
               "commandTimeoutSec": 300,
               "consoleTimeoutSec": 30,
-              "maxConsoleRows": 200,
-              "tempTablePageSize": 50,
-              "displayValueChars": 256,
-              "watchBudgetMs": 2000,
               "trace": false
             }
           }

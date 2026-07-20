@@ -45,7 +45,8 @@ export function activate(context: vscode.ExtensionContext): void {
 				name: 'Debug T-SQL script',
 				mode: 'script',
 				...buildScriptSource(editor.document),
-				stopOnEntry: true,
+				// stopOnEntry deliberately unset (A69): resolveDebugConfiguration fills it from
+				// tsqlDbg.defaults.*; the adapter defaults it to true when nothing sets it.
 			// A60: we debug the buffer's live text (buildScriptSource passes scriptText for unsaved/dirty
 			// docs), so VS Code's save-before-debug step is pure friction here — for an untitled buffer it
 			// pops a Save As dialog. Suppress it; a saved-but-dirty file is read from the live buffer too.
@@ -199,6 +200,38 @@ class EphemeralSecrets {
 	}
 }
 
+// DESIGN §17 (A69): the only launch keys whose default may come from the tsqlDbg.defaults.*
+// user/workspace settings. commitMode and allowConsoleWrites are deliberately NOT here — a
+// sticky, invisible settings default must never change the session's safety posture (§16).
+const SETTINGS_DEFAULTABLE_KEYS = [
+	'stopOnEntry',
+	'waitfor',
+	'boost',
+	'maxConsoleRows',
+	'tempTablePageSize',
+	'displayValueChars',
+	'watchBudgetMs',
+	'logLevel',
+] as const;
+
+// DESIGN §17 (A69): fill launch keys the config leaves unset from tsqlDbg.defaults.*.
+// inspect(), not get(): only a value the user explicitly set applies (folder > workspace >
+// user). The `default`s declared in package.json are Settings-UI display only, so the
+// adapter's LaunchConfig stays the single behavioral source of defaults for anything unset.
+function applySettingsDefaults(config: vscode.DebugConfiguration): void {
+	const defaults = vscode.workspace.getConfiguration('tsqlDbg.defaults');
+	for (const key of SETTINGS_DEFAULTABLE_KEYS) {
+		if (config[key] !== undefined) {
+			continue; // an explicit launch.json value always wins
+		}
+		const info = defaults.inspect(key);
+		const value = info?.workspaceFolderValue ?? info?.workspaceValue ?? info?.globalValue;
+		if (value !== undefined) {
+			config[key] = value;
+		}
+	}
+}
+
 // DESIGN §16 (A42, M10): when the launch config doesn't pin a server, resolve it — silently from
 // the mssql extension's active-editor connection when available, else from a saved connection
 // profile (the Connection Manager, which now also offers a "pick from mssql" entry). A pinned
@@ -228,12 +261,16 @@ class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 				config.request = 'launch';
 				config.name = 'Debug T-SQL script';
 				config.mode = 'script';
-				config.stopOnEntry = true;
+				// stopOnEntry deliberately left unset (A69): the settings-defaults chain below
+				// applies, and the adapter defaults it to true when nothing sets it.
 			}
 		}
 		if (config.type !== 'tsql') {
 			return config; // not a T-SQL session — leave it for whoever owns it
 		}
+
+		// A69: settings-supplied defaults — only for keys this launch config leaves unset.
+		applySettingsDefaults(config);
 
 		// Script is the default mode (procedure mode is opt-in via an explicit `procedure`).
 		if (!config.mode) {
