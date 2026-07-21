@@ -211,6 +211,68 @@ public sealed class SessionTests
         Assert.Contains(executor.ReceivedBatches, b => b.Contains("SET @a = 7;"));
     }
 
+    // A70 (§8.2): an omitted no-default OUTPUT parameter seeds NULL + a launch warning —
+    // the native caller's own `DECLARE @o int; EXEC proc @o OUTPUT` state — instead of erroring.
+    [Fact]
+    public async Task RunToEndAsync_ProcedureMode_OutputParamOmitted_SeedsNullAndWarns()
+    {
+        const string procDef = "CREATE PROCEDURE dbo.uspOut @In int, @O int OUTPUT AS BEGIN SET @O = @In; END";
+        var defResultSet = new ResultSet(
+            new[] { "def", "qi", "ansi_nulls" },
+            new IReadOnlyList<object?>[] { new object?[] { procDef, true, true } });
+
+        var executor = new FakeStatementExecutor()
+            .ThenEmpty()                                                          // SET options
+            .Then(_ => new BatchResult(new[] { defResultSet }, Array.Empty<string>()))  // OBJECT_DEFINITION + flags
+            .ThenEmpty()                                                          // CREATE TABLE #__dbg_s0
+            .ThenEmpty()                                                          // INSERT seed (@In = 1, @O NULL)
+            .ThenEmpty()                                                          // BEGIN TRANSACTION
+            .Then(_ => OkControlRow())                                            // SET @O = @In
+            .ThenEmpty();                                                        // ROLLBACK
+
+        var session = new Session(
+            new SessionOptions(
+                "DEVSQL01", "SalesDb", LaunchMode.Procedure, "dbo.uspOut",
+                new Dictionary<string, string> { ["@In"] = "1" }, null),
+            executor);
+
+        await session.RunToEndAsync();
+
+        Assert.Contains(executor.ReceivedBatches,
+            b => b.StartsWith("INSERT INTO #__dbg_s0") && b.Contains("VALUES (1, NULL"));
+        Assert.Contains(session.LaunchWarnings, w => w.Contains("@O is an OUTPUT parameter"));
+    }
+
+    // A70 guard: an OUTPUT parameter WITH a declared default keeps the default (branch order
+    // arg → default → OUTPUT-NULL → error), and produces no warning.
+    [Fact]
+    public async Task RunToEndAsync_ProcedureMode_OutputParamWithDefault_RunsDefaultInitializer()
+    {
+        const string procDef = "CREATE PROCEDURE dbo.uspOutDef @O int = 3 OUTPUT AS BEGIN SELECT @O AS v; END";
+        var defResultSet = new ResultSet(
+            new[] { "def", "qi", "ansi_nulls" },
+            new IReadOnlyList<object?>[] { new object?[] { procDef, true, true } });
+
+        var executor = new FakeStatementExecutor()
+            .ThenEmpty()                                                          // SET options
+            .Then(_ => new BatchResult(new[] { defResultSet }, Array.Empty<string>()))  // OBJECT_DEFINITION + flags
+            .ThenEmpty()                                                          // CREATE TABLE #__dbg_s0
+            .ThenEmpty()                                                          // INSERT seed (@O NULL, default runs next)
+            .ThenEmpty()                                                          // BEGIN TRANSACTION
+            .Then(_ => OkControlRow())                                            // synthetic SET @O = 3 (default initializer)
+            .Then(_ => OkControlRow())                                            // SELECT @O AS v
+            .ThenEmpty();                                                        // ROLLBACK
+
+        var session = new Session(
+            new SessionOptions("DEVSQL01", "SalesDb", LaunchMode.Procedure, "dbo.uspOutDef", null, null),
+            executor);
+
+        await session.RunToEndAsync();
+
+        Assert.Contains(executor.ReceivedBatches, b => b.Contains("SET @O = 3;"));
+        Assert.DoesNotContain(session.LaunchWarnings, w => w.Contains("OUTPUT parameter"));
+    }
+
     [Fact]
     public async Task RunToEndAsync_ProcedureMode_MissingRequiredArg_ThrowsBeforeAnyBatch()
     {

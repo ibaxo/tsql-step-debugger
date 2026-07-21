@@ -206,9 +206,10 @@ To debug a **deployed procedure** instead of a script, add a `launch.json` entry
 </details>
 
 `procedure` is a two/three-part name (required); `args` maps each parameter to a **T-SQL
-literal** — note `N'…'` for Unicode — and defaults to `{}`. **Every parameter the procedure
-declares (including `OUTPUT` parameters) must be supplied.** The connection comes from the
-Connection Manager here too.
+literal** — note `N'…'` for Unicode — and defaults to `{}`. Every parameter the procedure
+declares without a default must be supplied — **except `OUTPUT` parameters, which start
+`NULL` when omitted** (exactly like the native `DECLARE @o …; EXEC proc @o OUTPUT` caller;
+a launch warning notes each one). The connection comes from the Connection Manager here too.
 
 ## Configuration reference
 
@@ -338,9 +339,14 @@ Server-level options (env or process args): `MSSQL_DEBUG_TARGETS` (or `--targets
 Register it as an MCP server in your client. For Claude Code:
 
 ```bash
-claude mcp add tsql-debugger --env MSSQL_DEBUG_TARGETS=C:\path\to\targets.json -- \
-  dotnet C:\path\to\tsqldbg-mcp.dll
+claude mcp add tsql-debugger --env 'MSSQL_DEBUG_TARGETS=C:\path\to\targets.json' -- \
+  dotnet 'C:\path\to\tsqldbg-mcp.dll'
 ```
+
+> **Windows paths in a bash-like shell:** quote them (as above) — unquoted, bash eats the
+> backslashes (`C:\path\to\…` arrives as `C:pathto…`). Forward slashes work too
+> (`C:/path/to/targets.json` is accepted everywhere a path is), which sidesteps quoting
+> entirely.
 
 …or the equivalent client config block:
 

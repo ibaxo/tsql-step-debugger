@@ -13,16 +13,20 @@ public static class TraceTools
 {
     [McpServerTool(Name = "trace_procedure")]
     [Description("Trace a stored procedure to completion and return a summary plus a JSONL trace-file path " +
-                 "(one line per statement: the statement, variables after it, output, result sets, errors). " +
+                 "(one line per statement: the statement, changed variables, output, result sets, errors; " +
+                 "the summary carries the OUTPUT parameters' final values). " +
                  "The recommended FIRST tool for investigating a procedure — cheap, one round trip. Rolls " +
                  "back unless commit-gated (DESIGN §24.1). stepMode 'over' (default) or 'into'.")]
     public static Task<TraceResult> TraceProcedure(
         SessionRegistry registry,
         [Description("Connection + procedure to trace (server, database, procedure, args).")] SessionArgs args,
-        [Description("'over' (default) or 'into' (step into nested EXEC/dynamic SQL).")] string stepMode,
-        [Description("Also capture temp-table row counts per statement (extra cost). Default false.")] bool captureTempRowCounts,
-        CancellationToken cancellationToken)
-        => ToolGuard.Run(() => RunAsync(registry, args with { Mode = "procedure" }, stepMode, captureTempRowCounts, cancellationToken));
+        [Description("'over' (default) or 'into' (step into nested EXEC/dynamic SQL).")] string? stepMode = null,
+        [Description("Also capture temp-table row counts per statement (extra cost). Default false.")] bool captureTempRowCounts = false,
+        [Description("Per-step variables in the trace file: 'changed' (default — only variables whose value " +
+                     "changed this step; a frame's first stop is a full baseline) or 'full' (complete " +
+                     "snapshot every step).")] string? variableCapture = null,
+        CancellationToken cancellationToken = default)
+        => ToolGuard.Run(() => RunAsync(registry, args with { Mode = "procedure" }, stepMode, captureTempRowCounts, variableCapture, cancellationToken));
 
     [McpServerTool(Name = "trace_script")]
     [Description("Trace a T-SQL script (batches separated by GO) to completion and return a summary plus a " +
@@ -32,20 +36,33 @@ public static class TraceTools
     public static Task<TraceResult> TraceScript(
         SessionRegistry registry,
         [Description("Connection + script to trace (server, database, script text or scriptPath).")] SessionArgs args,
-        [Description("'over' (default) or 'into' (step into nested EXEC/dynamic SQL).")] string stepMode,
-        [Description("Also capture temp-table row counts per statement (extra cost). Default false.")] bool captureTempRowCounts,
-        CancellationToken cancellationToken)
-        => ToolGuard.Run(() => RunAsync(registry, args with { Mode = "script" }, stepMode, captureTempRowCounts, cancellationToken));
+        [Description("'over' (default) or 'into' (step into nested EXEC/dynamic SQL).")] string? stepMode = null,
+        [Description("Also capture temp-table row counts per statement (extra cost). Default false.")] bool captureTempRowCounts = false,
+        [Description("Per-step variables in the trace file: 'changed' (default — only variables whose value " +
+                     "changed this step; a frame's first stop is a full baseline) or 'full' (complete " +
+                     "snapshot every step).")] string? variableCapture = null,
+        CancellationToken cancellationToken = default)
+        => ToolGuard.Run(() => RunAsync(registry, args with { Mode = "script" }, stepMode, captureTempRowCounts, variableCapture, cancellationToken));
 
     private static async Task<TraceResult> RunAsync(
-        SessionRegistry registry, SessionArgs args, string stepMode, bool captureTempRowCounts, CancellationToken ct)
+        SessionRegistry registry, SessionArgs args, string? stepMode, bool captureTempRowCounts,
+        string? variableCapture, CancellationToken ct)
     {
+        // A70: refuse a bad enum BEFORE opening a session — no connection spent on a typo.
+        // Case-insensitive, like stepMode (review LOW-4).
+        if (!string.IsNullOrEmpty(variableCapture)
+            && !string.Equals(variableCapture, "changed", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(variableCapture, "full", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException($"variableCapture must be 'changed' or 'full', not '{variableCapture}'.");
+        }
+
         var session = await registry.OpenAsync(args, ct).ConfigureAwait(false);
         try
         {
             var mode = string.IsNullOrWhiteSpace(stepMode) ? "over" : stepMode;
             var (summary, filePath, steps) = await session
-                .RunTraceAsync(registry.Config.TraceOutputDirectory, mode, captureTempRowCounts, ct)
+                .RunTraceAsync(registry.Config.TraceOutputDirectory, mode, captureTempRowCounts, variableCapture, ct)
                 .ConfigureAwait(false);
 
             var note = $"Traced {steps} statement(s). The full per-statement record is at the path below " +

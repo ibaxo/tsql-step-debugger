@@ -197,6 +197,16 @@ public sealed record VariableDeclaration(
     public string StorageColumnType =>
         StorageCollation is null ? StorageType : $"{StorageType} COLLATE {StorageCollation}";
 
+    /// <summary>
+    /// DESIGN §8.2 (A70): whether this declaration is an <c>OUTPUT</c> parameter of its frame's
+    /// module — true for any procedure frame's OUTPUT formals (frame 0 and stepped-into callees
+    /// alike; their <see cref="Fragment"/> is a <see cref="ProcedureParameter"/>), never for an
+    /// ordinary DECLARE element. A70's consumers scope it themselves: the launch-time NULL seed
+    /// reads frame 0's extraction only, and the §24.8 trace summary's <c>outputParams</c>
+    /// projection reads <c>Frames[0]</c> only.
+    /// </summary>
+    public bool IsOutputParameter => Fragment is ProcedureParameter { Modifier: ParameterModifier.Output };
+
     /// <summary>Extracts all declarators of a DECLARE statement. DESIGN §7.2 / §8.2.</summary>
     public static IReadOnlyList<VariableDeclaration> Extract(DeclareVariableStatement declare, string fullScript)
     {

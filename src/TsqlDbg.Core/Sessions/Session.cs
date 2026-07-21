@@ -6710,7 +6710,11 @@ public sealed class Session
     // a supplied launch arg seeds the INSERT literal directly; an omitted parameter
     // with a declared default becomes a synthetic initializer (run once, before the
     // step loop, via the same pipeline as a DECLARE initializer); an omitted
-    // parameter with no default is a clear launch-time error rather than a silent NULL.
+    // parameter with no default is a clear launch-time error rather than a silent NULL —
+    // EXCEPT an OUTPUT parameter (A70): the native caller's own pattern is
+    // `DECLARE @o <type>; EXEC proc @o OUTPUT`, whose freshly declared @o IS NULL, so a
+    // NULL seed reproduces the common native call exactly. Seeded NULL with a launch
+    // warning (never silently), since T-SQL OUTPUT is in/out and a body may read it.
     private IReadOnlyList<VariableDeclaration> ExtractProcedureParameters(TSqlFragment parsed, string fullScript)
     {
         var script = (TSqlScript)parsed;
@@ -6742,6 +6746,20 @@ public sealed class Session
             {
                 var s = SourceSpan.Of(defaultExpr);
                 initializerSql = fullScript.Substring(s.StartOffset, s.Length);
+            }
+            else if (!hasArg && p.Modifier == ParameterModifier.Output)
+            {
+                // A70 review LOW-3: a CURSOR formal gets its own wording — a cursor has no
+                // literal form, so "supply it in 'args'" would be impossible advice; the A63
+                // unallocated start is the only (and the faithful) starting state.
+                _launchWarnings.Add(
+                    p.DataType is SqlDataTypeReference { SqlDataTypeOption: SqlDataTypeOption.Cursor }
+                        ? $"{name} is a cursor OUTPUT parameter of {_options.Procedure}: it starts unallocated " +
+                          "(the native caller's freshly DECLAREd cursor variable). A cursor has no literal " +
+                          "form, so launch 'args' cannot carry one (A63/A70)."
+                        : $"{name} is an OUTPUT parameter of {_options.Procedure} with no default and no launch arg: " +
+                          "starting NULL (the native caller's DECLARE-then-EXEC … OUTPUT pattern). Supply it in " +
+                          "'args' to start from a different value.");
             }
             else if (!hasArg)
             {

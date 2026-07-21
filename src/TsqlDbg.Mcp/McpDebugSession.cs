@@ -151,7 +151,10 @@ public sealed class McpDebugSession : IAsyncDisposable
         {
             Touch();
             _lastStopReason = "entry";
-            return BuildStopState("entry", Array.Empty<string>(), Array.Empty<ResultSet>());
+            // A70: the entry stop is the launch report — surface Core's LaunchWarnings (empty-TVP
+            // start, OUTPUT-param NULL seed, compat clamp, …) as the StopState.Warnings the DTO
+            // has always documented. Previously only the adapter surfaced them (§12.3 console).
+            return BuildStopState("entry", Array.Empty<string>(), Array.Empty<ResultSet>(), S.LaunchWarnings);
         }
         finally
         {
@@ -759,6 +762,10 @@ public sealed class McpDebugSession : IAsyncDisposable
             var returnCode = S.Frames.Count > 0 ? S.Frames[0].ReturnCode : 0;
             var finalState = S.IsBroken ? "faulted" : S.IsCompleted ? "completed" : "torn-down";
 
+            // A70 (§24.4): same OUTPUT-param projection the trace summary carries — read
+            // best-effort BEFORE teardown (never blocks it; null on any failure).
+            var outputParams = await CaptureOutputParamsAsync(default).ConfigureAwait(false);
+
             Func<Task<bool>>? decision = commitAuthorized ? () => Task.FromResult(true) : null;
             await _teardownAsync(decision).ConfigureAwait(false);
             Committed = commitAuthorized;
@@ -766,7 +773,7 @@ public sealed class McpDebugSession : IAsyncDisposable
             return new SessionSummary(
                 SessionId,
                 returnCode,
-                new Dictionary<string, string>(),
+                outputParams ?? new Dictionary<string, string>(),
                 Array.Empty<string>(),
                 finalState,
                 commitAuthorized,
@@ -783,9 +790,22 @@ public sealed class McpDebugSession : IAsyncDisposable
     // DESIGN §24.3/§24.8: drive to completion with the auto-stepper, capturing a per-statement
     // record to a JSONL file. Returns the summary + file path (the record is on disk, never
     // inlined — token cost). Teardown is unconditional rollback unless the commit gate holds.
+    // A70: variableCapture "changed" (default) records only the variables whose rendered value
+    // differs from the SAME frame's previous stop (a frame's first stop is a full baseline);
+    // "full" records the complete snapshot every step (the pre-A70 shape). The diff is computed
+    // client-side from the same full read either way — the choice changes the file, not the
+    // per-step query cost.
     public async Task<(SessionSummary Summary, string FilePath, int Steps)> RunTraceAsync(
-        string traceDir, string stepMode, bool captureTempRowCounts, CancellationToken ct)
+        string traceDir, string stepMode, bool captureTempRowCounts, string? variableCapture, CancellationToken ct)
     {
+        // Case-insensitive, like stepMode (review LOW-4).
+        var fullCapture =
+            string.IsNullOrEmpty(variableCapture) || string.Equals(variableCapture, "changed", StringComparison.OrdinalIgnoreCase)
+                ? false
+                : string.Equals(variableCapture, "full", StringComparison.OrdinalIgnoreCase)
+                    ? true
+                    : throw new ArgumentException($"variableCapture must be 'changed' or 'full', not '{variableCapture}'.");
+
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -794,10 +814,17 @@ public sealed class McpDebugSession : IAsyncDisposable
             var kind = string.Equals(stepMode, "into", StringComparison.OrdinalIgnoreCase) ? StepKind.Into : StepKind.Over;
 
             await using var writer = new StreamWriter(filePath, append: false);
-            await writer.WriteLineAsync(TraceJson.Header(SessionId, Server, Database, Mode, stepMode)).ConfigureAwait(false);
+            await writer.WriteLineAsync(TraceJson.Header(
+                SessionId, Server, Database, Mode, stepMode, fullCapture ? "full" : "changed")).ConfigureAwait(false);
 
             var seq = 0;
-            var messages = new List<string>();
+            // A70: launch warnings lead the summary messages — Mode A has no entry stop, so this
+            // is the only place the agent can learn e.g. that an OUTPUT param was NULL-seeded.
+            var messages = new List<string>(S.LaunchWarnings);
+            // A70: per-frame baseline for the "changed" diff, keyed by frame identity (a re-entered
+            // frame is a new object, so recursion gets a fresh full baseline). Popped frames are
+            // pruned each iteration so a deep step-into trace cannot accumulate dead baselines.
+            var previousVars = new Dictionary<Frame, Dictionary<string, string>>();
             while (!S.IsCompleted)
             {
                 Touch();   // M11 gate (MAJOR): a long trace stays fresh so the idle sweep can't dispose it mid-run
@@ -827,15 +854,24 @@ public sealed class McpDebugSession : IAsyncDisposable
                 var notes = DrainNotes();
 
                 Dictionary<string, string>? vars = null;
+                Dictionary<string, string>? changed = null;
                 Dictionary<string, string>? tempCounts = null;
                 // Capture the frame's post-statement state, but never let an inspection read
                 // abort the whole trace: a step that popped/faulted the frame (FrameCompleted,
-                // FrameFaulted) can leave its state table gone. Record "unavailable" instead.
+                // FrameFaulted) can leave its state table gone. Record "unavailable" instead
+                // (A70: as an ABSENT variables field — nulls are omitted from the line).
                 if (!S.IsBroken && frame is not null && S.Frames.Any(f => ReferenceEquals(f, frame)))
                 {
                     try
                     {
                         vars = await CaptureVariablesAsync(frame, ct).ConfigureAwait(false);
+                        if (!fullCapture)
+                        {
+                            changed = DiffVariables(previousVars.TryGetValue(frame, out var prev) ? prev : null, vars);
+                            previousVars[frame] = vars;
+                            vars = null;   // the line carries the delta, not the snapshot
+                        }
+
                         if (captureTempRowCounts)
                         {
                             tempCounts = await CaptureTempCountsAsync(frame, ct).ConfigureAwait(false);
@@ -843,14 +879,26 @@ public sealed class McpDebugSession : IAsyncDisposable
                     }
                     catch (Exception ex)
                     {
-                        vars = new Dictionary<string, string> { ["__capture_error"] = ex.Message };
+                        // Do NOT update previousVars — the next successful read diffs against the
+                        // last good baseline, so no change is silently swallowed by the error step.
+                        var failure = new Dictionary<string, string> { ["__capture_error"] = ex.Message };
+                        vars = fullCapture ? failure : null;
+                        changed = fullCapture ? null : failure;
+                    }
+                }
+
+                if (previousVars.Count > S.Frames.Count)
+                {
+                    foreach (var dead in previousVars.Keys.Where(f => !S.Frames.Any(live => ReferenceEquals(live, f))).ToList())
+                    {
+                        previousVars.Remove(dead);
                     }
                 }
 
                 var err = CurrentError();
                 await writer.WriteLineAsync(TraceJson.Step(
-                    seq, frame?.Module.Display, current?.Span.StartLine ?? 0, current?.Text,
-                    vars, tempCounts, msgs, sets.Select(ToResultSetInfo).ToList(), err, notes)).ConfigureAwait(false);
+                    seq, frame?.Ordinal, frame?.Module.Display, current?.Span.StartLine ?? 0, current?.Text,
+                    vars, changed, tempCounts, msgs, sets.Select(ToResultSetInfo).ToList(), err, notes)).ConfigureAwait(false);
             }
 
             var returnCode = S.Frames.Count > 0 ? S.Frames[0].ReturnCode : 0;
@@ -860,7 +908,14 @@ public sealed class McpDebugSession : IAsyncDisposable
             // partial work), even under commitMode:"commit" + allowWrites.
             var commitAuthorized = S.IsCompleted && TargetResolver.CommitAuthorized(_args.CommitModeRequested, _target);
 
-            await writer.WriteLineAsync(TraceJson.Summary(returnCode, finalState, commitAuthorized, seq)).ConfigureAwait(false);
+            // A70: summary carries the frame-0 OUTPUT params' FINAL values (procedure mode,
+            // best-effort — absent when the state is unreadable) and the messages deduplicated
+            // ("… (occurred N×)"); the per-step lines keep every message verbatim in place.
+            var outputParams = await CaptureOutputParamsAsync(ct).ConfigureAwait(false);
+            var dedupedMessages = DedupeMessages(messages);
+
+            await writer.WriteLineAsync(TraceJson.Summary(
+                returnCode, outputParams, dedupedMessages, finalState, commitAuthorized, seq)).ConfigureAwait(false);
             await writer.FlushAsync().ConfigureAwait(false);
 
             Func<Task<bool>>? decision = commitAuthorized ? () => Task.FromResult(true) : null;
@@ -868,7 +923,8 @@ public sealed class McpDebugSession : IAsyncDisposable
             Committed = commitAuthorized;
 
             var summary = new SessionSummary(
-                SessionId, returnCode, new Dictionary<string, string>(), messages, finalState, commitAuthorized, seq);
+                SessionId, returnCode, outputParams ?? new Dictionary<string, string>(),
+                dedupedMessages, finalState, commitAuthorized, seq);
             return (summary, filePath, seq);
         }
         finally
@@ -888,6 +944,88 @@ public sealed class McpDebugSession : IAsyncDisposable
         }
 
         return map;
+    }
+
+    // A70 (§24.8): the "changed" projection — variables whose rendered value differs from the
+    // same frame's previous stop. A frame's first stop (previous == null) is a full baseline.
+    // Catalog order is preserved (current iterates in registration order); a variable can never
+    // LEAVE the map mid-frame (§8.2 hoisting — the catalog is fixed at frame init), so absence
+    // from `changed` always means "same value as the last time it appeared".
+    private static Dictionary<string, string> DiffVariables(
+        Dictionary<string, string>? previous, Dictionary<string, string> current)
+    {
+        if (previous is null)
+        {
+            return current;
+        }
+
+        var delta = new Dictionary<string, string>();
+        foreach (var (name, value) in current)
+        {
+            if (!previous.TryGetValue(name, out var before) || !string.Equals(before, value, StringComparison.Ordinal))
+            {
+                delta[name] = value;
+            }
+        }
+
+        return delta;
+    }
+
+    // A70 (§24.8): collapse repeated identical messages ("Cannot step into X — stepping over"
+    // fires per call site) into one entry with a count, preserving first-occurrence order.
+    internal static IReadOnlyList<string> DedupeMessages(List<string> messages)
+    {
+        var counts = new Dictionary<string, int>();
+        var order = new List<string>();
+        foreach (var m in messages)
+        {
+            if (counts.TryGetValue(m, out var c))
+            {
+                counts[m] = c + 1;
+            }
+            else
+            {
+                counts[m] = 1;
+                order.Add(m);
+            }
+        }
+
+        return order.Select(m => counts[m] == 1 ? m : $"{m} (occurred {counts[m]}×)").ToList();
+    }
+
+    // A70 (§24.8/§24.4): the frame-0 OUTPUT parameters' final values for the summary —
+    // procedure mode only, best-effort (null when frame 0 is gone or its state unreadable;
+    // a summary field must never fail the trace or block teardown). Read BEFORE teardown.
+    private async Task<Dictionary<string, string>?> CaptureOutputParamsAsync(CancellationToken ct)
+    {
+        if (Mode != "procedure" || S.IsBroken || S.Frames.Count == 0)
+        {
+            return null;
+        }
+
+        var frameZero = S.Frames[0];
+        var outputSlots = frameZero.Variables.All.Where(s => s.Declaration.IsOutputParameter).ToList();
+        if (outputSlots.Count == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            var snap = await S.GetStateSnapshotAsync(frameZero, ct).ConfigureAwait(false);
+            var map = new Dictionary<string, string>();
+            foreach (var slot in outputSlots)
+            {
+                var has = snap.TryGet(slot.Declaration.Name, out var v);
+                map[slot.Declaration.Name] = !has || v is null ? "NULL" : v.ToString() ?? "NULL";
+            }
+
+            return map;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task<Dictionary<string, string>> CaptureTempCountsAsync(Frame frame, CancellationToken ct)
