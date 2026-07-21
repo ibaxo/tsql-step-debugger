@@ -163,6 +163,10 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
             SupportsHitConditionalBreakpoints = true,
             SupportsGotoTargetsRequest = true,
             SupportsEvaluateForHovers = true,
+            // §12.4 (A71): without this, VS Code's Copy Value copies the RENDERED row
+            // text — for a budget-overflowed watch that is literally "⏱ (click to
+            // evaluate)" — instead of asking us for the real value.
+            SupportsClipboardContext = true,
             SupportsSetVariable = true,
             // M6 G1 (§13, A23): logpoints ride the per-module breakpoint store (S2).
             SupportsLogPoints = true,
@@ -1190,7 +1194,13 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
             {
                 var hasValue = values.TryGet(slot.Declaration.Name, out var value);
                 var display = !hasValue || value is null ? "NULL" : value.ToString() ?? "NULL";
-                return new Variable(slot.Declaration.Name, display, 0) { Type = slot.Declaration.DataTypeSql };
+                // A71: evaluateName routes Copy Value through evaluate context:"clipboard"
+                // (and makes Add to Watch produce the right expression).
+                return new Variable(slot.Declaration.Name, display, 0)
+                {
+                    Type = slot.Declaration.DataTypeSql,
+                    EvaluateName = slot.Declaration.Name,
+                };
             })
             .ToList();
     }
@@ -1388,7 +1398,7 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         var args = responder.Arguments;
         _trace.Event("dap.request", $"evaluate context={args.Context} expr={args.Expression}");
 
-        if (args.Context is not (EvaluateArguments.ContextValue.Hover or EvaluateArguments.ContextValue.Repl or EvaluateArguments.ContextValue.Watch))
+        if (args.Context is not (EvaluateArguments.ContextValue.Hover or EvaluateArguments.ContextValue.Repl or EvaluateArguments.ContextValue.Watch or EvaluateArguments.ContextValue.Clipboard))
         {
             responder.SetError(new ProtocolException($"evaluate context '{args.Context}' is not yet implemented (M5)."));
             return;
@@ -1441,6 +1451,9 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
             return;
         }
 
+        // Hover and clipboard (A71) share the token resolution: variable → snapshot
+        // value, temp object → its rendered value string.
+        var isClipboard = args.Context == EvaluateArguments.ContextValue.Clipboard;
         var token = (args.Expression ?? string.Empty).Trim();
 
         // Variable → the I1 value cache. Locals are per-FRAME (T-SQL scoping), never
@@ -1454,10 +1467,32 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
 
         // Temp/table-var name resolvable in the hovered frame's CHAIN → the I4 value
         // string (frame.TempObjects is already the chain-resolved, deduped list).
-        var tempEntry = frame.TempObjects.FirstOrDefault(o => string.Equals(o.OriginalName, token, StringComparison.OrdinalIgnoreCase));
+        // Clipboard additionally matches the PHYSICAL name: a Temp Tables row's
+        // evaluateName is the physical name (I4), and that is the expression VS Code's
+        // Copy Value sends back (A71).
+        var tempEntry = frame.TempObjects.FirstOrDefault(o =>
+            string.Equals(o.OriginalName, token, StringComparison.OrdinalIgnoreCase)
+            || (isClipboard && string.Equals(o.PhysicalName, token, StringComparison.OrdinalIgnoreCase)));
         if (tempEntry is not null)
         {
             _ = HoverTempObjectAsync(responder, snapshot, tempEntry);
+            return;
+        }
+
+        if (isClipboard)
+        {
+            // A71: Copy Value on a watch row (VS Code sends the watch's expression
+            // text) — explicit user intent, the §12.4 click-to-evaluate class: runs
+            // OUTSIDE the shared watch budget under consoleTimeoutSec, cancellable,
+            // and never consumes the budget nor marks the expression overflowed.
+            var clipboardFrame = _liveSession.Session.Frames.FirstOrDefault(f => f.Ordinal == frameOrdinal);
+            if (clipboardFrame is null)
+            {
+                responder.SetError(new ProtocolException("no such frame"));
+                return;
+            }
+
+            _ = EvaluateWatchAndRespondAsync(responder, clipboardFrame, token, isClickToEvaluate: true);
             return;
         }
 
