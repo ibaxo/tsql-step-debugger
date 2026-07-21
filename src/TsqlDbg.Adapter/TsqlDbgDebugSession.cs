@@ -397,9 +397,9 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         _ = SetBreakpointsLockedAsync(responder, responder.Arguments.Source, requested);
     }
 
-    // DESIGN §13: "map each line to the first SU whose OriginalStartLine >= line ...
-    // Respond verified:true with the actual line ... unmappable -> verified:false +
-    // message." Conditional/hit-count state resets on every setBreakpoints call — DAP
+    // DESIGN §13 (A72): map each line to the SU whose bindable lines contain it, else
+    // forward to the first SU whose OriginalStartLine >= line. "Respond verified:true
+    // with the actual line ... unmappable -> verified:false + message." Conditional/hit-count state resets on every setBreakpoints call — DAP
     // replaces the full breakpoint set for a source each time it's sent (this is also
     // how the ratified hit-count ruling's "counters reset on setBreakpoints
     // replacement" clause is satisfied). M6 S2/A22: the set now replaces exactly one

@@ -38,6 +38,14 @@ public sealed class StatementUnit
     public SourceSpan Span { get; }
     public string Text { get; }                 // byte-exact original slice (§5.3)
 
+    /// <summary>A72 (§13): the last line a breakpoint/Run-to-Cursor request binds INTO
+    /// this unit from. Leaf units: the span's end line (any line of a multi-line
+    /// statement binds to it). IF/WHILE: the PREDICATE's end line — their fragment
+    /// span swallows the whole body, and §13's fall-forward behavior (body lines bind
+    /// to the units inside, END lines to the unit after the block) must survive
+    /// containment mapping.</summary>
+    public int BindEndLine { get; }
+
     internal StatementUnit(int ordinal, TSqlStatement fragment, ClassificationResult c, string fullScript)
     {
         Ordinal = ordinal;
@@ -46,7 +54,18 @@ public sealed class StatementUnit
         SubKind = c.SubKind;
         Span = SourceSpan.Of(fragment);
         Text = fullScript.Substring(Span.StartOffset, Span.Length);
+        BindEndLine = fragment switch
+        {
+            IfStatement { Predicate: { } p } => PredicateEndLine(p, Span.StartLine),
+            WhileStatement { Predicate: { } p } => PredicateEndLine(p, Span.StartLine),
+            _ => Span.EndLine,
+        };
     }
+
+    private static int PredicateEndLine(TSqlFragment predicate, int fallback)
+        => predicate.StartOffset >= 0 && predicate.FragmentLength > 0
+            ? SourceSpan.Of(predicate).EndLine
+            : fallback;
 
     public override string ToString() => $"SU#{Ordinal} {Kind}/{SubKind} @L{Span.StartLine}: {Truncate(Text)}";
     private static string Truncate(string s) => s.Length <= 60 ? s : s[..57] + "...";
@@ -133,17 +152,41 @@ public sealed class StatementIndex
     }
 
     /// <summary>
-    /// §13 mapping: a requested breakpoint line binds to the FIRST unit whose StartLine ≥
-    /// line (source order — so lines inside IF/WHILE bodies bind to the units inside
-    /// them, and a label line binds forward to the unit after the label). Returns false
-    /// when the line is past the last unit (caller answers verified:false).
+    /// §13 mapping (A72): a requested line binds to the unit whose BINDABLE lines
+    /// contain it — any line of a multi-line leaf statement binds to that statement
+    /// (Run to Cursor on line 2 of a 3-line SELECT stops AT that SELECT, not at the
+    /// unit after it); for IF/WHILE only the predicate's lines bind in (<see
+    /// cref="StatementUnit.BindEndLine"/>), so lines inside their bodies keep binding
+    /// to the units inside them, and END/label/blank lines keep binding FORWARD to the
+    /// first unit whose StartLine ≥ line (the pre-A72 rule). When a line is both
+    /// inside a containing unit and at-or-above a forward unit, the forward unit wins
+    /// only if it starts within the containing unit's bindable span (statements
+    /// sharing a line keep the forward tie). Returns false only when the line is past
+    /// every unit's last bindable line (caller answers verified:false).
     /// </summary>
     public bool TryMapBreakpointLine(int requestedLine, out StatementUnit unit)
     {
+        StatementUnit? containing = null;
         foreach (var u in _units)
         {
-            if (u.Span.StartLine >= requestedLine) { unit = u; return true; }
+            if (u.Span.StartLine >= requestedLine)
+            {
+                unit = containing is not null && u.Span.StartLine > containing.BindEndLine ? containing : u;
+                return true;
+            }
+
+            if (u.BindEndLine >= requestedLine)
+            {
+                containing = u;   // source order → the LAST match is the innermost
+            }
         }
+
+        if (containing is not null)
+        {
+            unit = containing;
+            return true;
+        }
+
         unit = null!;
         return false;
     }

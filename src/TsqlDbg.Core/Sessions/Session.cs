@@ -346,8 +346,8 @@ public sealed class Session
     /// file, not just the currently active batch — every batch's blueprint is already
     /// resolved at launch (<see cref="_batches"/>), so mapping is immediate; unlike a
     /// stepped-into procedure there is no "pending until this module loads" path. Scans
-    /// batches in file order, applying the normal §13 forward-scan rule (first SU with
-    /// OriginalStartLine ≥ requestedLine) within each one. Because batches occupy
+    /// batches in file order, applying the normal §13 mapping rule (containing-span
+    /// first, else forward scan — A72) within each one. Because batches occupy
     /// DISJOINT, increasing file-line ranges, the first batch with a match IS "the batch
     /// whose line range contains the requested line" — a line that falls in the gap
     /// between two batches (the GO separator itself, or a comment before the next

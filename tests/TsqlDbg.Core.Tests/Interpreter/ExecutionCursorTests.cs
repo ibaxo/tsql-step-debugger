@@ -243,6 +243,93 @@ public class ExecutionCursorTests
         Assert.False(c.Index.TryMapBreakpointLine(5, out _));                // past the last unit
     }
 
+    // A72 (§13): any line of a multi-line leaf statement binds to THAT statement —
+    // the pre-A72 forward-only scan overshot to the next unit (the reported
+    // Run-to-Cursor symptom: line 2 of a 3-line SELECT ran past it).
+    [Fact]
+    public void BreakpointMapping_LineInsideMultiLineStatement_BindsToThatStatement()
+    {
+        var c = Cursor(
+            "SELECT 1 AS a\n" +      // L1..L3: one 3-line SELECT
+            "     , 2 AS b\n" +
+            "  FROM (VALUES (0)) v(x);\n" +
+            "PRINT 'next';\n");      // L4
+
+        Assert.True(c.Index.TryMapBreakpointLine(2, out var mid));
+        Assert.Equal(1, mid.Span.StartLine);                                 // the SELECT, not PRINT
+
+        Assert.True(c.Index.TryMapBreakpointLine(3, out var tail));
+        Assert.Equal(1, tail.Span.StartLine);
+
+        Assert.True(c.Index.TryMapBreakpointLine(4, out var next));
+        Assert.Equal(4, next.Span.StartLine);                                // PRINT unaffected
+    }
+
+    // A72: the tail of the frame's LAST statement is now mappable (was verified:false).
+    [Fact]
+    public void BreakpointMapping_TailOfLastStatement_BindsToIt_PastItStillFalse()
+    {
+        var c = Cursor("SELECT 1 AS a\n     , 2 AS b;\n");                   // L1..L2, nothing after
+
+        Assert.True(c.Index.TryMapBreakpointLine(2, out var tail));
+        Assert.Equal(1, tail.Span.StartLine);
+
+        Assert.False(c.Index.TryMapBreakpointLine(3, out _));                // past every bindable line
+    }
+
+    // A72: IF/WHILE bind only via their PREDICATE lines — body lines keep falling to
+    // the units inside, and the block-closing END keeps falling FORWARD past the block
+    // (never back up to the header).
+    [Fact]
+    public void BreakpointMapping_IfBlock_BodyAndEndLines_KeepFallingForward()
+    {
+        var c = Cursor(
+            "IF 1 = 1\n" +           // L1: IF (fragment span swallows L1..L6)
+            "BEGIN\n" +              // L2
+            "    SELECT 1 AS a\n" +  // L3..L4: multi-line SELECT inside the body
+            "         , 2 AS b;\n" +
+            "    PRINT 'in';\n" +    // L5
+            "END\n" +                // L6
+            "PRINT 'after';\n");     // L7
+
+        Assert.True(c.Index.TryMapBreakpointLine(2, out var onBegin));
+        Assert.Equal(3, onBegin.Span.StartLine);                             // BEGIN → first body unit
+
+        Assert.True(c.Index.TryMapBreakpointLine(4, out var inSelect));
+        Assert.Equal(3, inSelect.Span.StartLine);                            // tail line → the SELECT
+
+        Assert.True(c.Index.TryMapBreakpointLine(6, out var onEnd));
+        Assert.Equal(7, onEnd.Span.StartLine);                               // END → unit AFTER the block
+    }
+
+    // A72: a multi-line predicate's continuation line binds to the IF/WHILE unit itself.
+    [Fact]
+    public void BreakpointMapping_MultiLinePredicate_BindsToTheControlUnit()
+    {
+        var c = Cursor(
+            "IF 1 = 1\n" +           // L1..L2: predicate spans two lines
+            "   AND 2 = 2\n" +
+            "    PRINT 'then';\n" +  // L3
+            "PRINT 'after';\n");     // L4
+
+        Assert.True(c.Index.TryMapBreakpointLine(2, out var predicateTail));
+        Assert.Equal(SuSubKind.If, predicateTail.SubKind);
+        Assert.Equal(1, predicateTail.Span.StartLine);
+    }
+
+    // A72 tie rule: when another statement STARTS on a line the previous multi-line
+    // statement also occupies, the forward unit wins (pre-A72 tie preserved).
+    [Fact]
+    public void BreakpointMapping_StatementsSharingALine_ForwardTieWins()
+    {
+        var c = Cursor(
+            "SELECT 1 AS a\n" +      // L1..L2: SELECT ends on L2...
+            "     , 2 AS b; PRINT 'same line';\n");                          // ...where PRINT starts
+
+        Assert.True(c.Index.TryMapBreakpointLine(2, out var unit));
+        Assert.Equal(SuSubKind.Print, unit.SubKind);
+    }
+
     [Fact]
     public void UnitText_IsByteExactOriginalSlice()
     {
