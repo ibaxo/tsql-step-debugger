@@ -5,6 +5,11 @@ name: Build & Publish Extension
 # for a human. On approval it publishes the Windows build to the VS Code Marketplace and attaches
 # every VSIX to a GitHub pre-release for manual install.
 #
+# Each platform build also publishes the standalone MCP server (src/TsqlDbg.Mcp) as a
+# self-contained archive, so agents can download a ready-to-run binary from the GitHub
+# pre-release instead of cloning and building from source. The release job attaches those
+# archives plus a SHA256SUMS.txt covering every asset. Same gate: nothing until approval.
+#
 # How a run goes:
 #   1. `build` compiles each target and uploads its VSIX as a run artifact. Nothing is published.
 #   2. `publish` PAUSES for a required reviewer. This is your window: open the run, download the
@@ -110,6 +115,36 @@ jobs:
           path: tsql-step-debugger-${{ matrix.target }}.vsix
           if-no-files-found: error
 
+      # Standalone MCP server for agents (DESIGN §24). Self-contained and NOT trimmed:
+      # the MCP SDK discovers tools via reflection, trimming would break it. The binary
+      # is stamped with the release version so a downloaded copy is identifiable.
+      - name: Publish self-contained MCP server (${{ matrix.rid }})
+        shell: bash
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ]; then V=$(node -p "require('./extension/package.json').version"); fi
+          dotnet publish src/TsqlDbg.Mcp -c Release \
+            -r ${{ matrix.rid }} --self-contained \
+            -p:Version="$V" \
+            -o mcp-publish/${{ matrix.rid }}
+
+      # zip on Windows, tar.gz on Unix -- tar preserves the executable bit on the
+      # apphost, which zip tooling does not do reliably.
+      - name: Package MCP server archive (${{ matrix.rid }})
+        shell: bash
+        run: |
+          case "${{ matrix.rid }}" in
+            win-*) (cd mcp-publish/${{ matrix.rid }} && 7z a "../../tsqldbg-mcp-${{ matrix.rid }}.zip" *) ;;
+            *)     tar -C mcp-publish/${{ matrix.rid }} -czf "tsqldbg-mcp-${{ matrix.rid }}.tar.gz" . ;;
+          esac
+
+      - name: Upload MCP server artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: mcp-${{ matrix.rid }}
+          path: tsqldbg-mcp-${{ matrix.rid }}.*
+          if-no-files-found: error
+
       # The run page is where you pick the VSIX up, so say so on the run page.
       - name: Note what to do next
         shell: bash
@@ -121,6 +156,10 @@ jobs:
             echo '```'
             echo "code --install-extension tsql-step-debugger-${{ matrix.target }}.vsix"
             echo '```'
+            echo ""
+            echo "Also built: standalone **MCP server** archive (\`mcp-${{ matrix.rid }}\` artifact) --"
+            echo "attached to the GitHub pre-release on approval, with a SHA256SUMS.txt."
+            echo ""
             echo "Nothing is published until you **approve** the \`publish\` job below."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -172,9 +211,25 @@ jobs:
       - name: Download all VSIX artifacts
         uses: actions/download-artifact@v7
         with:
-          path: dist-vsix
+          path: dist
           pattern: vsix-*
           merge-multiple: true
+
+      - name: Download all MCP server artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: mcp-*
+          merge-multiple: true
+
+      # Checksums over every asset so a downloader (human or agent) can verify the bytes.
+      # Written outside dist/ first so the sums file never lists itself.
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          (cd dist && sha256sum *) > SHA256SUMS.txt
+          mv SHA256SUMS.txt dist/
+          cat dist/SHA256SUMS.txt
 
       - name: Create / update GitHub pre-release
         env:
@@ -182,9 +237,9 @@ jobs:
         shell: bash
         run: |
           TAG="v${{ steps.v.outputs.version }}"
-          NOTES="Pre-release build. The Windows build is published to the VS Code Marketplace; the Linux and macOS VSIXs are attached here for manual install (\`code --install-extension <file>.vsix\`)."
+          NOTES="Pre-release build. The Windows build is published to the VS Code Marketplace; the Linux and macOS VSIXs are attached here for manual install (\`code --install-extension <file>.vsix\`). The \`tsqldbg-mcp-*\` archives are the standalone self-contained MCP server -- unpack and run \`tsqldbg-mcp\`, no .NET install needed. Verify downloads against SHA256SUMS.txt."
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist-vsix/*.vsix --clobber
+            gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist-vsix/*.vsix --title "$TAG" --notes "$NOTES" --prerelease
+            gh release create "$TAG" dist/* --title "$TAG" --notes "$NOTES" --prerelease
           fi
