@@ -268,6 +268,7 @@ to your database.
 | `tsqlDbg.mssql.useActiveEditorConnection` | `true` | Auto-use the active `.sql` file's mssql connection when set. |
 | `tsqlDbg.mssql.useConnectionPicker` | `true` | At launch, open mssql's own connection picker first. Set `false` to lead with the debugger's Connection Manager, with mssql as a secondary entry. |
 | `tsqlDbg.adapterPath` | — | Dev override: absolute path to a locally-built `TsqlDbg.Adapter`. |
+| `tsqlDbg.mcpPath` | — | Dev override: absolute path to a locally-built `tsqldbg-mcp` (MCP server). The bundled server is registered with VS Code agent mode automatically; this points that registration at a dev build. |
 
 ---
 
@@ -338,19 +339,44 @@ Server-level options (env or process args): `MSSQL_DEBUG_TARGETS` (or `--targets
 
 ## Connecting an MCP client
 
-Register it as an MCP server in your client. For Claude Code:
+Pick whichever fits how you got the tool. **A** is zero-config; **B** needs no .NET install.
+
+### A. VS Code agent mode — automatic (nothing to configure)
+
+If you have the **T-SQL Step Debugger** VS Code extension installed (VS Code 1.101+), the
+bundled MCP server is registered with VS Code's agent mode for you — it appears in the MCP
+server list (and to Copilot / any MCP client in that window) with no `mcp.json` to write. Put a
+`targets.json` at your workspace root and the extension points the server at it automatically;
+otherwise set `MSSQL_DEBUG_TARGETS` in your environment. That's it.
+
+### B. Any MCP client — self-contained binary (no .NET runtime needed)
+
+Download the `tsqldbg-mcp-<platform>` archive from the [GitHub release](https://github.com/ibaxo/tsql-step-debugger/releases),
+unpack it, and point your client's `command` straight at the `tsqldbg-mcp` executable. For
+Claude Code:
 
 ```bash
-claude mcp add tsql-debugger --env 'MSSQL_DEBUG_TARGETS=C:\path\to\targets.json' -- \
-  dotnet 'C:\path\to\tsqldbg-mcp.dll'
+claude mcp add tsql-debugger --env 'MSSQL_DEBUG_TARGETS=C:/path/to/targets.json' -- \
+  'C:/path/to/tsqldbg-mcp.exe'
 ```
 
-> **Windows paths in a bash-like shell:** quote them (as above) — unquoted, bash eats the
-> backslashes (`C:\path\to\…` arrives as `C:pathto…`). Forward slashes work too
-> (`C:/path/to/targets.json` is accepted everywhere a path is), which sidesteps quoting
-> entirely.
+…or the equivalent client config block (`~/.claude.json`, `mcp.json`, Claude Desktop, etc.):
 
-…or the equivalent client config block:
+```json
+{
+  "mcpServers": {
+    "tsql-debugger": {
+      "command": "C:\\path\\to\\tsqldbg-mcp.exe",
+      "args": [],
+      "env": { "MSSQL_DEBUG_TARGETS": "C:\\path\\to\\targets.json" }
+    }
+  }
+}
+```
+
+### C. From a source build — via `dotnet`
+
+If you built it yourself (`dotnet build`, framework-dependent), launch the DLL with `dotnet`:
 
 ```json
 {
@@ -363,6 +389,10 @@ claude mcp add tsql-debugger --env 'MSSQL_DEBUG_TARGETS=C:\path\to\targets.json'
   }
 }
 ```
+
+> **Windows paths in a bash-like shell:** quote them — unquoted, bash eats the backslashes
+> (`C:\path\to\…` arrives as `C:pathto…`). Forward slashes work too
+> (`C:/path/to/targets.json` is accepted everywhere a path is), which sidesteps quoting entirely.
 
 For SQL-auth targets, also set `TSQLDBG_SQL_PASSWORD` in `env` (never as a tool argument).
 
@@ -423,7 +453,7 @@ adapter and the MCP server are two thin hosts over it (see [`docs/DESIGN.md`](do
 
 # Requirements
 
-- **VS Code extension:** VS Code 1.85+ on Windows (x64) — the adapter is bundled, so no .NET
+- **VS Code extension:** VS Code 1.101+ on Windows (x64) — the adapter is bundled, so no .NET
   runtime needed — and a reachable SQL Server 2016+ dev/test instance.
 - **MCP server / building from source:** .NET 8 runtime (or SDK to build); any OS the .NET
   runtime supports.

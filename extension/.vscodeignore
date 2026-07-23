@@ -1,7 +1,10 @@
 # DESIGN.md §7/D7 packaging: ship only what the extension needs at runtime.
 # The extension bundle is dist/extension.js (esbuild, --external:vscode, no
-# node_modules needed at runtime) plus the self-contained adapter payload the
-# packaging script publishes into bin/win-x64/ before `vsce package` runs.
+# node_modules needed at runtime) plus two self-contained .NET payloads the
+# packaging script publishes before `vsce package` runs: the DAP adapter in
+# bin/<rid>/ and the MCP server (DESIGN §24) in bin-mcp/<rid>/, the latter
+# registered with VS Code agent mode by registerMcpServerProvider. Neither
+# bin/ nor bin-mcp/ is excluded here, so both ship in the VSIX.
 .vscodeignore
 src/**
 tsconfig.json

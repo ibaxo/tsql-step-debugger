@@ -96,6 +96,23 @@ jobs:
           -r ${{ matrix.rid }} --self-contained
           -o extension/bin/${{ matrix.rid }}
 
+      # Standalone MCP server for agents (DESIGN §24), bundled INTO the VSIX so installing the
+      # extension registers it with VS Code's agent mode (extension.ts registerMcpServerProvider)
+      # with zero manual config. Published into extension/bin-mcp/<rid>/ BEFORE `vsce package` so
+      # it ships in the VSIX; the same output is archived below for standalone GitHub-release use.
+      # A folder SEPARATE from the adapter's bin/<rid>/ keeps the two self-contained runtimes from
+      # clobbering each other. Self-contained and NOT trimmed: the MCP SDK discovers tools via
+      # reflection, so trimming would break it. Stamped with the release version.
+      - name: Publish self-contained MCP server (${{ matrix.rid }})
+        shell: bash
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ]; then V=$(node -p "require('./extension/package.json').version"); fi
+          dotnet publish src/TsqlDbg.Mcp -c Release \
+            -r ${{ matrix.rid }} --self-contained \
+            -p:Version="$V" \
+            -o extension/bin-mcp/${{ matrix.rid }}
+
       - name: Build extension bundle
         working-directory: extension
         shell: bash
@@ -115,27 +132,16 @@ jobs:
           path: tsql-step-debugger-${{ matrix.target }}.vsix
           if-no-files-found: error
 
-      # Standalone MCP server for agents (DESIGN §24). Self-contained and NOT trimmed:
-      # the MCP SDK discovers tools via reflection, trimming would break it. The binary
-      # is stamped with the release version so a downloaded copy is identifiable.
-      - name: Publish self-contained MCP server (${{ matrix.rid }})
-        shell: bash
-        run: |
-          V="${{ github.event.inputs.version }}"
-          if [ -z "$V" ]; then V=$(node -p "require('./extension/package.json').version"); fi
-          dotnet publish src/TsqlDbg.Mcp -c Release \
-            -r ${{ matrix.rid }} --self-contained \
-            -p:Version="$V" \
-            -o mcp-publish/${{ matrix.rid }}
-
-      # zip on Windows, tar.gz on Unix -- tar preserves the executable bit on the
-      # apphost, which zip tooling does not do reliably.
+      # Archive the SAME self-contained MCP payload that was just bundled into the VSIX
+      # (extension/bin-mcp/<rid>/) so it is also downloadable standalone from the GitHub
+      # pre-release. zip on Windows, tar.gz on Unix -- tar preserves the executable bit on
+      # the apphost, which zip tooling does not do reliably.
       - name: Package MCP server archive (${{ matrix.rid }})
         shell: bash
         run: |
           case "${{ matrix.rid }}" in
-            win-*) (cd mcp-publish/${{ matrix.rid }} && 7z a "../../tsqldbg-mcp-${{ matrix.rid }}.zip" *) ;;
-            *)     tar -C mcp-publish/${{ matrix.rid }} -czf "tsqldbg-mcp-${{ matrix.rid }}.tar.gz" . ;;
+            win-*) (cd extension/bin-mcp/${{ matrix.rid }} && 7z a "../../../tsqldbg-mcp-${{ matrix.rid }}.zip" *) ;;
+            *)     tar -C extension/bin-mcp/${{ matrix.rid }} -czf "tsqldbg-mcp-${{ matrix.rid }}.tar.gz" . ;;
           esac
 
       - name: Upload MCP server artifact

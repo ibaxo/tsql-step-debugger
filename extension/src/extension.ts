@@ -95,6 +95,96 @@ export function activate(context: vscode.ExtensionContext): void {
 		}),
 		connectionStatus,
 	);
+
+	// Publish the bundled MCP server (DESIGN §24, M11) to VS Code's agent mode so installing
+	// this extension makes the debugger's programmatic surface discoverable to Copilot / MCP
+	// clients with no hand-written mcp.json. Pure wiring; the server owns all behavior.
+	registerMcpServerProvider(context);
+}
+
+// VS Code MCP provider API (finalized 1.101): hand VS Code the path to the bundled,
+// self-contained MCP host (extension/bin-mcp/<rid>/tsqldbg-mcp) plus the workspace targets.json
+// allowlist location, so agent mode discovers and launches it automatically. CLAUDE.md
+// "extension/ … no logic": we only wire the executable + env; §24.1 default-deny still governs
+// (no targets file ⇒ the server refuses start_session). Bundled binary = same trust model and
+// same version as the adapter shipped beside it.
+function registerMcpServerProvider(context: vscode.ExtensionContext): void {
+	// Degrade quietly on VS Code older than the extension's engine floor rather than throwing
+	// during activate (a mismatched host, or a future API rename).
+	const lm = vscode.lm as { registerMcpServerDefinitionProvider?: Function } | undefined;
+	if (typeof lm?.registerMcpServerDefinitionProvider !== 'function') {
+		return;
+	}
+	const provider = vscode.lm.registerMcpServerDefinitionProvider('tsqldbg.mcpServer', {
+		provideMcpServerDefinitions: async (): Promise<vscode.McpServerDefinition[]> => {
+			const command = resolveMcpServerPath(context);
+			// Only advertise the server when its binary is actually present: a from-source dev
+			// build (or a platform the VSIX didn't bundle) has no bin-mcp payload, and surfacing
+			// a server that can't launch is worse than surfacing none. A dev override still wins.
+			if (!fs.existsSync(command)) {
+				return [];
+			}
+			const env: Record<string, string> = {};
+			const targets = resolveWorkspaceTargetsFile();
+			if (targets) {
+				// DESIGN §24.9: the allowlist location. When absent we set nothing — VS Code
+				// merges our env over the parent, so a machine-wide MSSQL_DEBUG_TARGETS still
+				// flows through, and failing that the server default-denies. Never fabricated.
+				env.MSSQL_DEBUG_TARGETS = targets;
+			}
+			return [
+				new vscode.McpStdioServerDefinition(
+					'T-SQL Step Debugger',
+					command,
+					[],
+					env,
+					String(context.extension.packageJSON.version),
+				),
+			];
+		},
+		resolveMcpServerDefinition: (server) => server,
+	});
+	context.subscriptions.push(provider);
+}
+
+// Mirror of resolveAdapterPath for the MCP host binary. The packaging step publishes it
+// self-contained into extension/bin-mcp/<rid>/ — a folder SEPARATE from the adapter's bin/<rid>/
+// so the two self-contained .NET runtimes never overwrite each other. Dev override: tsqlDbg.mcpPath.
+function resolveMcpServerPath(context: vscode.ExtensionContext): string {
+	const devOverride = vscode.workspace.getConfiguration('tsqlDbg').get<string>('mcpPath');
+	if (devOverride && devOverride.length > 0) {
+		return devOverride;
+	}
+	const exeName = os.platform() === 'win32' ? 'tsqldbg-mcp.exe' : 'tsqldbg-mcp';
+	const mcpPath = path.join(context.extensionPath, 'bin-mcp', adapterRid(), exeName);
+	// As with the adapter, a VSIX zipped on Windows drops the Unix executable bit — restore it
+	// before VS Code launches the server (no-op if absent; the missing-binary case is caught by
+	// the existsSync guard in the provider above).
+	if (os.platform() !== 'win32') {
+		try {
+			fs.chmodSync(mcpPath, 0o755);
+		} catch {
+			/* best-effort */
+		}
+	}
+	return mcpPath;
+}
+
+// The workspace's targets.json allowlist, if present in the first workspace folder — the same
+// file the adapter resolves as ${workspaceFolder}/targets.json (§4-step-1). Passed to the MCP
+// server as MSSQL_DEBUG_TARGETS so an agent's start_session has an allowlist with no manual env
+// setup. No workspace or no file ⇒ undefined, and the server's §24.1 default-deny does the rest.
+function resolveWorkspaceTargetsFile(): string | undefined {
+	// First workspace folder only: a background MCP server has no "current file" to key a
+	// multi-root choice off, so a targets.json in a non-first root isn't auto-found (the user
+	// falls back to a machine-wide MSSQL_DEBUG_TARGETS). Safe by construction — the worst case
+	// is over-denial (§24.1), never over-permission.
+	const folder = vscode.workspace.workspaceFolders?.[0];
+	if (!folder) {
+		return undefined;
+	}
+	const candidate = path.join(folder.uri.fsPath, 'targets.json');
+	return fs.existsSync(candidate) ? candidate : undefined;
 }
 
 // DESIGN.md §2/§17: the self-contained adapter exe, bundled at extension/bin/<rid>/ by the
