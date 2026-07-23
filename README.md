@@ -1,7 +1,7 @@
 # T-SQL Step Debugger
 
-[![Report Bug](https://img.shields.io/badge/Report%20Bug-red?logo=github)](https://github.com/ibaxo/tsql-step-debugger/issues/new?labels=bug)
-[![Request Feature](https://img.shields.io/badge/Request%20Feature-blue?logo=github)](https://github.com/ibaxo/tsql-step-debugger/issues/new?labels=enhancement)
+[![Report Bug](https://img.shields.io/badge/Report%20Bug-red?logo=github)](https://github.com/ibaxo/tsql-step-debugger/issues/new?template=bug_report.yml)
+[![Request Feature](https://img.shields.io/badge/Request%20Feature-blue?logo=github)](https://github.com/ibaxo/tsql-step-debugger/issues/new?template=feature_request.yml)
 
 > Set a breakpoint in a `.sql` file, press **F5**, and step through T-SQL like real code —
 > watching variables, temp tables, and the call stack live against a real SQL Server.
