@@ -52,6 +52,25 @@ export function activate(context: vscode.ExtensionContext): void {
 			// pops a Save As dialog. Suppress it; a saved-but-dirty file is read from the live buffer too.
 			}, { suppressSaveBeforeStart: true });
 		}),
+		// A73: one-click "Trace T-SQL Script" — the §24.3 Mode A trace on the interactive
+		// surface. Same source resolution as the debug button; `traceRun` flips the adapter
+		// into the non-interactive trace-to-end mode, stepMode "into" because the button's
+		// whole point is the everything-inlined trace (launch.json users pick their own).
+		vscode.commands.registerCommand('tsqldbg.traceEditorScript', async () => {
+			const editor = vscode.window.activeTextEditor;
+			if (!editor || (editor.document.languageId !== 'sql' && !editor.document.isUntitled)) {
+				void vscode.window.showInformationMessage('Open a .sql file (or an unsaved buffer) to trace it as a T-SQL script.');
+				return;
+			}
+			await vscode.debug.startDebugging(vscode.workspace.getWorkspaceFolder(editor.document.uri), {
+				type: 'tsql',
+				request: 'launch',
+				name: 'Trace T-SQL script',
+				mode: 'script',
+				traceRun: { stepMode: 'into' },
+				...buildScriptSource(editor.document),
+			}, { suppressSaveBeforeStart: true });
+		}),
 		// "T-SQL File" in File → New File… (file/newFile menu). Opens an untitled buffer with the
 		// sql language already set, so the ▷ Debug button, breakpoints, and F5 work immediately —
 		// combined with A60 the file never needs to touch disk.

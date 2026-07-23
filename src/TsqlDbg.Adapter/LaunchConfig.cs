@@ -43,7 +43,10 @@ public sealed record LaunchConfig(
     // shows debuggee output/errors/results/logpoints/§16 notices only; true
     // (logLevel:"verbose") also surfaces the debugger's own diagnostic annotations
     // (NOCOUNT-forced, GO batch-entry, untracked SET options, DML-trigger heads-up).
-    bool Verbose)
+    bool Verbose,
+    // DESIGN §17 (A73): non-interactive trace-to-end mode. Null = normal interactive
+    // launch; non-null = §24.3 Mode A on the DAP surface (no stops, console + §24.8 file).
+    TraceRunConfig? TraceRun)
 {
     public static LaunchConfig Parse(IDictionary<string, JToken> properties)
     {
@@ -127,7 +130,50 @@ public sealed record LaunchConfig(
             GetBool(properties, "encrypt") ?? false,
             GetString(properties, "options"),
             // DESIGN §12.3/§15 (A56): console verbosity.
-            verbose);
+            verbose,
+            // DESIGN §17 (A73): trace-run mode.
+            ParseTraceRun(properties));
+    }
+
+    // DESIGN §17 (A73): `traceRun` is false (absent) | true (all defaults) | an options
+    // object. stepMode follows the MCP arg's discipline (anything but an exact
+    // case-insensitive "into" is Over — §24.4 default); variableCapture REFUSES an
+    // unrecognized value (same as the MCP tool arg, §24.9 — a silently-wrong capture
+    // shape is worse than a failed launch).
+    private static TraceRunConfig? ParseTraceRun(IDictionary<string, JToken> properties)
+    {
+        if (!properties.TryGetValue("traceRun", out var token) || token.Type == JTokenType.Null)
+        {
+            return null;
+        }
+
+        if (token.Type == JTokenType.Boolean)
+        {
+            return token.Value<bool>() ? new TraceRunConfig(StepKind.Over, false, false, null) : null;
+        }
+
+        if (token is not JObject obj)
+        {
+            throw new ProtocolLaunchException("launch config 'traceRun' must be a boolean or an options object.");
+        }
+
+        var stepMode = obj.Value<string>("stepMode") ?? "over";
+        var kind = stepMode.Equals("into", StringComparison.OrdinalIgnoreCase) ? StepKind.Into : StepKind.Over;
+
+        var variableCapture = obj.Value<string>("variableCapture");
+        var fullCapture =
+            string.IsNullOrEmpty(variableCapture) || variableCapture.Equals("changed", StringComparison.OrdinalIgnoreCase)
+                ? false
+                : variableCapture.Equals("full", StringComparison.OrdinalIgnoreCase)
+                    ? true
+                    : throw new ProtocolLaunchException(
+                        $"launch config 'traceRun.variableCapture' must be 'changed' or 'full', not '{variableCapture}'.");
+
+        return new TraceRunConfig(
+            kind,
+            obj.Value<bool?>("captureTempRowCounts") ?? false,
+            fullCapture,
+            obj.Value<string>("file"));
     }
 
     private static string RequireString(IDictionary<string, JToken> properties, string key)
@@ -167,6 +213,14 @@ public sealed record LaunchConfig(
         return ((JArray)token).Select(t => t.Value<string>()).Where(s => !string.IsNullOrEmpty(s)).ToList()!;
     }
 }
+
+// DESIGN §17 (A73): the parsed traceRun options — §24.4 trace_* knobs on the launch surface,
+// plus an optional explicit trace-file path (else a timestamped file under the OS temp dir).
+public sealed record TraceRunConfig(
+    StepKind StepMode,
+    bool CaptureTempRowCounts,
+    bool FullVariableCapture,
+    string? File);
 
 // Thin marker so LaunchConfig.Parse doesn't need a dependency on the DAP library's
 // ProtocolException; TsqlDbgDebugSession translates this to one at the DAP boundary.

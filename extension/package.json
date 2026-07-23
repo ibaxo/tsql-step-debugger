@@ -112,6 +112,12 @@
         "icon": "$(debug-alt)"
       },
       {
+        "command": "tsqldbg.traceEditorScript",
+        "title": "Trace T-SQL Script (Run to End)",
+        "category": "T-SQL Debug",
+        "icon": "$(run-all)"
+      },
+      {
         "command": "tsqldbg.newSqlFile",
         "title": "New T-SQL File",
         "shortTitle": "T-SQL File",
@@ -140,11 +146,20 @@
           "command": "tsqldbg.debugEditorScript",
           "when": "resourceLangId == sql",
           "group": "navigation@1"
+        },
+        {
+          "command": "tsqldbg.traceEditorScript",
+          "when": "resourceLangId == sql",
+          "group": "navigation@2"
         }
       ],
       "commandPalette": [
         {
           "command": "tsqldbg.debugEditorScript",
+          "when": "resourceLangId == sql"
+        },
+        {
+          "command": "tsqldbg.traceEditorScript",
           "when": "resourceLangId == sql"
         }
       ]
@@ -241,6 +256,43 @@
                 "type": "boolean",
                 "default": true,
                 "description": "Publish a stop at frame 0's first statement before running anything, instead of running to completion."
+              },
+              "traceRun": {
+                "type": [
+                  "boolean",
+                  "object"
+                ],
+                "default": false,
+                "description": "Non-interactive trace mode: run to completion (no stops — breakpoints and stopOnEntry are ignored), streaming one line per executed statement (with variable changes, output, result sets) to the Debug Console and writing the full JSONL trace file. true = defaults; or an object: { \"stepMode\": \"over\"|\"into\" (default over; the Trace button uses into), \"captureTempRowCounts\": false, \"variableCapture\": \"changed\"|\"full\", \"file\": \"explicit trace-file path\" }. Rollback-always unless commitMode is 'commit' AND the run completed — then the usual commit confirmation modal.",
+                "properties": {
+                  "stepMode": {
+                    "type": "string",
+                    "enum": [
+                      "over",
+                      "into"
+                    ],
+                    "default": "over",
+                    "description": "'over' traces frame 0's statements only; 'into' steps into procedures, dynamic SQL, and triggers-eligible calls, tracing every inlined statement."
+                  },
+                  "captureTempRowCounts": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Record each live temp table/table variable's row count on every step (extra round trips)."
+                  },
+                  "variableCapture": {
+                    "type": "string",
+                    "enum": [
+                      "changed",
+                      "full"
+                    ],
+                    "default": "changed",
+                    "description": "'changed' records only variables whose value changed since the same frame's previous statement (first stop = full baseline); 'full' records the complete snapshot every step."
+                  },
+                  "file": {
+                    "type": "string",
+                    "description": "Explicit trace-file path. Default: a timestamped .jsonl under the OS temp dir (tsqldbg-traces)."
+                  }
+                }
               },
               "waitfor": {
                 "type": "string",

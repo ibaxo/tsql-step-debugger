@@ -421,6 +421,16 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         await _executor.Gate.WaitAsync().ConfigureAwait(false);
         try
         {
+            // A73 review LOW-4: a request queued behind a long gate-hold (a trace run holds
+            // the gate for the whole session) can win it only after teardown — answer
+            // unverified instead of dereferencing the nulled session below.
+            if (_liveSession is null)
+            {
+                responder.SetResponse(new SetBreakpointsResponse(
+                    requested.Select(_ => new Breakpoint { Verified = false, Message = "Session has ended." }).ToList()));
+                return;
+            }
+
             var (identity, sourceError, pendingFilePath) = ResolveModuleIdentity(source);
             if (identity is null && pendingFilePath is null)
             {
@@ -672,6 +682,15 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         await _executor.Gate.WaitAsync().ConfigureAwait(false);
         try
         {
+            // A73 review MED-1: re-check under the gate — a request that queued behind a
+            // long gate-hold (a trace run holds it for the whole session) can win the gate
+            // only AFTER teardown nulled _liveSession; the pre-gate check above is stale then.
+            if (_liveSession is null)
+            {
+                responder.SetResponse(new TsqldbgSourceResponseBody { Content = "-- tsqldbg: no active session." });
+                return;
+            }
+
             var (index, message) = await _liveSession.Session.TryGetModuleIndexAsync(identity).ConfigureAwait(false);
             responder.SetResponse(new TsqldbgSourceResponseBody { Content = index?.FullScript ?? $"-- tsqldbg: {message}" });
         }
@@ -741,6 +760,38 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
     protected override ConfigurationDoneResponse HandleConfigurationDoneRequest(ConfigurationDoneArguments arguments)
     {
         _trace.Event("dap.configurationDone", string.Empty);
+
+        // DESIGN §17/§24.3 (A73): traceRun mode — no entry stop, no breakpoint checks, no
+        // stopped events at all. Drive to completion with the shared Core auto-stepper,
+        // stream the per-statement projection to the Debug Console, write the §24.8 file,
+        // then terminate. Pause/Stop cancels the in-flight statement via _pauseCts (the
+        // §10.5 attention) and ends the trace partial (rollback).
+        if (_launchConfig?.TraceRun is { } traceRun)
+        {
+            _executor.BeginResume();
+            // A73 review LOW-2: arm the pause/terminate cancellation NOW, on the protocol
+            // thread — a Stop landing before the background task wins the gate must still
+            // cancel the run rather than waiting out the entire trace.
+            var traceCts = new CancellationTokenSource();
+            _pauseCts = traceCts;
+            _ = Task.Run(async () =>
+            {
+                await _executor.Gate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (_liveSession is not null)
+                    {
+                        await RunTraceLockedAsync(traceRun, traceCts).ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    _executor.Gate.Release();
+                }
+            });
+
+            return new ConfigurationDoneResponse();
+        }
 
         var stopOnEntry = _launchConfig?.StopOnEntry ?? true;
         // M5 I1/I2 (A15): epoch bumps synchronously, right here, before the
@@ -937,7 +988,11 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
     // byte-matched a real sourceMap file — then that file's real Source rides
     // instead, so breakpoints in it (ResolveModuleIdentity) line up with what the
     // user is actually looking at.
-    private Source? BuildFrameSource(SnapshotFrame frame)
+    private Source? BuildFrameSource(SnapshotFrame frame) => BuildModuleSource(frame.Module);
+
+    // A73: factored to take the module identity directly so trace-run console lines
+    // (EmitTraceStep) build the identical Source a stack frame would carry.
+    private Source? BuildModuleSource(Core.Interpreter.ModuleIdentity module)
     {
         if (_launchConfig is null)
         {
@@ -947,18 +1002,18 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         // M8 (§5.4): every script batch frame (not just ordinal 0) is the one real
         // workspace .sql file — batches ≥ 1 carry a fresh non-zero ordinal but share
         // ModuleIdentity.Script(), so gate on IsScript, not Ordinal == 0.
-        if (frame.Module.IsScript && _launchConfig.Mode == LaunchMode.Script)
+        if (module.IsScript && _launchConfig.Mode == LaunchMode.Script)
         {
             var scriptPath = _launchConfig.ScriptPath;
             return scriptPath is null ? null : new Source { Name = FrameSourceName(scriptPath), Path = scriptPath };
         }
 
-        if (_liveSession is not null && _liveSession.Session.TryGetSourceMapFile(frame.Module, out var file) && file is not null)
+        if (_liveSession is not null && _liveSession.Session.TryGetSourceMapFile(module, out var file) && file is not null)
         {
             return new Source { Name = Path.GetFileName(file), Path = file };
         }
 
-        return new Source { Name = frame.Module.Display, Path = BuildVirtualDocPath(frame.Module) };
+        return new Source { Name = module.Display, Path = BuildVirtualDocPath(module) };
     }
 
     // A60: the script frame's Source.Path may be a real filesystem path OR an unsaved buffer's
@@ -2082,6 +2137,206 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         {
             Protocol.SendEvent(new OutputEvent($"{rendered}\n") { Category = OutputEvent.CategoryValue.Stdout });
         }
+    }
+
+    // ---- trace-run mode (§17/§24.3, A73) ----------------------------------------
+
+    // DESIGN §17/A73: the non-interactive trace-to-end launch — Core's TraceRunner (the
+    // §24.3 Mode A loop shared with the MCP trace_* tools) driven under this adapter's
+    // gate, rendering each step to the Debug Console and writing the §24.8 JSONL file.
+    // Caller holds the executor's gate. Ends the session (terminated event) either way.
+    private async Task RunTraceLockedAsync(TraceRunConfig traceRun, CancellationTokenSource cts)
+    {
+        var session = _liveSession!.Session;
+        var config = _launchConfig!;
+        var stepModeLabel = traceRun.StepMode == StepKind.Into ? "into" : "over";
+        var captureLabel = traceRun.FullVariableCapture ? "full" : "changed";
+
+        TraceRunResult result;
+        string filePath;
+        var committed = false;
+        try
+        {
+            // §24.8: the machine record rides alongside the console projection — an explicit
+            // `traceRun.file` wins, else a timestamped file under the OS temp dir. A73 review
+            // LOW-6: a RELATIVE file resolves against the workspace folder (the adapter
+            // process's CWD is where VS Code spawned it — never where the user is looking).
+            filePath = string.IsNullOrEmpty(traceRun.File)
+                ? Path.Combine(Path.GetTempPath(), "tsqldbg-traces", $"run-{DateTime.Now:yyyyMMdd-HHmmss-fff}.jsonl")
+                : Path.IsPathRooted(traceRun.File) || string.IsNullOrEmpty(config.WorkspaceFolder)
+                    ? Path.GetFullPath(traceRun.File)
+                    : Path.GetFullPath(Path.Combine(config.WorkspaceFolder, traceRun.File));
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+
+            Protocol.SendEvent(new OutputEvent(
+                $"Trace run (stepMode: {stepModeLabel}, variables: {captureLabel}) — executing to completion; " +
+                "breakpoints and stops are disabled in this mode.\n")
+            { Category = OutputEvent.CategoryValue.Console });
+
+            await using var writer = new StreamWriter(filePath, append: false);
+            await writer.WriteLineAsync(TraceJsonWriter.Header(
+                sessionId: null, config.Server, config.Database,
+                config.Mode == LaunchMode.Script ? "script" : "procedure",
+                stepModeLabel, captureLabel, startedFrom: "launch")).ConfigureAwait(false);
+
+            // A73 console error hygiene: a CATCH transit keeps the error context active for
+            // every statement in the block — record each in the file (§24.8 presence contract)
+            // but print it once per distinct error, not per statement.
+            TraceErrorRecord? lastPrintedError = null;
+            result = await TraceRunner.RunAsync(
+                session,
+                new TraceRunOptions(traceRun.StepMode, traceRun.CaptureTempRowCounts, traceRun.FullVariableCapture),
+                async step =>
+                {
+                    await writer.WriteLineAsync(
+                        TraceJsonWriter.Step(step, session.MaxConsoleRows, session.DisplayValueChars)).ConfigureAwait(false);
+                    lastPrintedError = EmitTraceStep(step, lastPrintedError);
+                },
+                keepAlive: null,
+                cts.Token).ConfigureAwait(false);
+
+            // §16/A39 mirrored through the MCP N2 rule: only a run that actually COMPLETED may
+            // reach the commit modal — a cancelled (Stop pressed) or faulted partial trace
+            // rolls back unconditionally, even when commitMode:"commit" is armed. The modal
+            // runs BEFORE the summary line so the file records the real outcome.
+            if (result.FinalState == TraceFinalState.Completed && config.CommitMode == CommitMode.Commit)
+            {
+                committed = await RequestCommitConfirmationAsync().ConfigureAwait(false);
+            }
+
+            await writer.WriteLineAsync(TraceJsonWriter.Summary(
+                result.ReturnCode, result.OutputParams, result.Messages,
+                TraceJsonWriter.FinalStateLabel(result.FinalState), committed, result.StepCount)).ConfigureAwait(false);
+            await writer.FlushAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await ReportFaultAndEndLockedAsync(ex).ConfigureAwait(false);
+            return;
+        }
+        finally
+        {
+            _pauseCts = null;
+        }
+
+        EmitTraceSummary(result, committed, filePath, session.LaunchWarnings);
+
+        // Teardown mirrors TerminateLiveSessionLockedAsync, with the commit decision already
+        // settled above (a constant — the modal never runs twice).
+        _executor.MarkIdle();
+        Func<Task<bool>>? decision = committed ? () => Task.FromResult(true) : null;
+        await _liveSession!.DisposeAsync(decision).ConfigureAwait(false);
+        _liveSession = null;
+        SendEvent(new TerminatedEvent(), "terminated");
+    }
+
+    // A73: the human projection of one §24.8 step — a source-linked console line (click to
+    // navigate: OutputEvent carries Source+Line), then the statement's own output/result
+    // sets/error through the same categories the interactive surface uses (§18). Returns
+    // the error it printed (or null once the error context clears) so the caller can
+    // dedupe a CATCH transit's repeated context across steps.
+    private TraceErrorRecord? EmitTraceStep(TraceStepRecord step, TraceErrorRecord? lastPrintedError)
+    {
+        var text = new StringBuilder();
+        text.Append($"{step.Seq,4}  {step.Module?.Display ?? "?"}:{step.Line}  {FirstLine(step.StatementText)}");
+        var delta = step.VariablesChanged ?? step.VariablesAfter;
+        if (delta is { Count: > 0 })
+        {
+            var rendered = string.Join(", ", delta.Select(kv => $"{kv.Key}={kv.Value}"));
+            if (rendered.Length > 256)
+            {
+                rendered = rendered[..256] + "…";
+            }
+
+            text.Append($"   {{{rendered}}}");
+        }
+
+        var evt = new OutputEvent($"{text}\n") { Category = OutputEvent.CategoryValue.Console };
+        if (step.Module is not null)
+        {
+            // A73 review MED-1: attach only REAL-file sources (the script itself, an unsaved
+            // buffer, a sourceMap-matched module). A tsqldbg: virtual doc needs a live session
+            // to serve content, and a trace run's session is torn down the moment the console
+            // outlives it — a dead link is worse than plain text.
+            var source = BuildModuleSource(step.Module);
+            if (source?.Path is { } sourcePath && !sourcePath.StartsWith(VirtualDocScheme, StringComparison.OrdinalIgnoreCase))
+            {
+                evt.Source = source;
+                evt.Line = step.Line;
+            }
+        }
+
+        Protocol.SendEvent(evt);
+
+        foreach (var message in step.Output)
+        {
+            Protocol.SendEvent(new OutputEvent($"      {message}\n") { Category = OutputEvent.CategoryValue.Console });
+        }
+
+        if (Verbose)
+        {
+            foreach (var note in step.Notes)
+            {
+                Protocol.SendEvent(new OutputEvent($"      {note}\n") { Category = OutputEvent.CategoryValue.Console });
+            }
+        }
+
+        EmitStepResultSets(step.ResultSets);
+
+        if (step.Error is { } error && !error.Equals(lastPrintedError))
+        {
+            var where = (error.Procedure is { } proc ? $", Procedure {proc}" : string.Empty)
+                + (error.Line is { } line ? $", Line {line}" : string.Empty);
+            Protocol.SendEvent(new OutputEvent(
+                $"      Msg {error.Number}, Level {error.Severity}, State {error.State}{where}: {error.Message} (→ {error.RoutedTo})\n")
+            { Category = OutputEvent.CategoryValue.Stderr });
+        }
+
+        return step.Error;
+    }
+
+    // A73: the end-of-run block — the §24.8 summary projection plus the trace-file path.
+    private void EmitTraceSummary(
+        TraceRunResult result, bool committed, string filePath, IReadOnlyList<string> launchWarnings)
+    {
+        var state = TraceJsonWriter.FinalStateLabel(result.FinalState);
+        var outcome = committed ? "committed" : "rolled back";
+        var sb = new StringBuilder();
+        sb.AppendLine($"── trace {state}: {result.StepCount} statements, return code {result.ReturnCode}, {outcome} ──");
+        if (result.FinalState == TraceFinalState.Incomplete)
+        {
+            // A73 review LOW-3: make the cancel legible — "incomplete" alone reads like a bug.
+            sb.AppendLine("Run was cancelled before completion (Pause/Stop) — partial trace, rolled back.");
+        }
+
+        if (result.OutputParams is { Count: > 0 })
+        {
+            sb.AppendLine("OUTPUT parameters: " + string.Join(", ", result.OutputParams.Select(kv => $"{kv.Key} = {kv.Value}")));
+        }
+
+        // A73 review LOW-1: the launch warnings already printed at launch (HandleLaunchRequest,
+        // always shown) — don't re-print the verbatim ones here. The FILE summary keeps them
+        // leading `messages` (§24.8/A70 — the file must stand alone; the console doesn't).
+        foreach (var message in result.Messages.Where(m => !launchWarnings.Contains(m)))
+        {
+            sb.AppendLine(message);
+        }
+
+        sb.AppendLine($"Trace file: {filePath}");
+        Protocol.SendEvent(new OutputEvent(sb.ToString()) { Category = OutputEvent.CategoryValue.Console });
+    }
+
+    // A73: one readable console line per statement — first source line, hard-capped.
+    private static string FirstLine(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return string.Empty;
+        }
+
+        var idx = text.IndexOfAny(new[] { '\r', '\n' });
+        var head = idx < 0 ? text : $"{text[..idx]} …";
+        return head.Length > 160 ? $"{head[..160]}…" : head;
     }
 
     private async Task StepOnceLockedAsync(int epoch, StoppedEvent.ReasonValue reasonOnStop, StepKind kind = StepKind.Over)

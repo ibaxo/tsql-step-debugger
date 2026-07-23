@@ -69,4 +69,73 @@ public sealed class LaunchConfigTests
         Assert.Equal(200, config.MaxConsoleRows);
         Assert.Equal(2000, config.WatchBudgetMs);
     }
+
+    // ---- §17 traceRun (A73) -----------------------------------------------------
+
+    [Fact]
+    public void Parse_NoTraceRun_DefaultsNull()
+    {
+        Assert.Null(LaunchConfig.Parse(BaseProperties()).TraceRun);
+    }
+
+    [Fact]
+    public void Parse_TraceRunFalse_IsNull()
+    {
+        var properties = BaseProperties();
+        properties["traceRun"] = false;
+
+        Assert.Null(LaunchConfig.Parse(properties).TraceRun);
+    }
+
+    [Fact]
+    public void Parse_TraceRunTrue_AllDefaults()
+    {
+        var properties = BaseProperties();
+        properties["traceRun"] = true;
+
+        var traceRun = LaunchConfig.Parse(properties).TraceRun;
+
+        Assert.NotNull(traceRun);
+        Assert.Equal(StepKind.Over, traceRun!.StepMode);        // §24.4 trace_* default
+        Assert.False(traceRun.CaptureTempRowCounts);
+        Assert.False(traceRun.FullVariableCapture);             // "changed" (§24.8/A70)
+        Assert.Null(traceRun.File);
+    }
+
+    [Fact]
+    public void Parse_TraceRunObject_ThreadsAllKnobs()
+    {
+        var properties = BaseProperties();
+        properties["traceRun"] = JObject.Parse(
+            "{ \"stepMode\": \"Into\", \"captureTempRowCounts\": true, \"variableCapture\": \"Full\", \"file\": \"C:/tmp/t.jsonl\" }");
+
+        var traceRun = LaunchConfig.Parse(properties).TraceRun;
+
+        Assert.NotNull(traceRun);
+        Assert.Equal(StepKind.Into, traceRun!.StepMode);        // case-insensitive, like the MCP arg
+        Assert.True(traceRun.CaptureTempRowCounts);
+        Assert.True(traceRun.FullVariableCapture);
+        Assert.Equal("C:/tmp/t.jsonl", traceRun.File);
+    }
+
+    [Fact]
+    public void Parse_TraceRunUnrecognizedStepMode_FallsBackToOver()
+    {
+        // Same unrecognized-defaults-safe discipline as waitfor/commitMode.
+        var properties = BaseProperties();
+        properties["traceRun"] = JObject.Parse("{ \"stepMode\": \"sideways\" }");
+
+        Assert.Equal(StepKind.Over, LaunchConfig.Parse(properties).TraceRun!.StepMode);
+    }
+
+    [Fact]
+    public void Parse_TraceRunInvalidVariableCapture_RefusesTheLaunch()
+    {
+        // §24.9 parity with the MCP tool arg: a silently-wrong capture shape is worse
+        // than a failed launch.
+        var properties = BaseProperties();
+        properties["traceRun"] = JObject.Parse("{ \"variableCapture\": \"delta\" }");
+
+        Assert.Throws<ProtocolLaunchException>(() => LaunchConfig.Parse(properties));
+    }
 }

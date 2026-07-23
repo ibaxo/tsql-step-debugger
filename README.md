@@ -54,6 +54,7 @@ breakpoints, and the ▷ button already active.
 |---|---|
 | **Step through T-SQL** | Step Over, Into, Out, and Continue — statement by statement, against a real SQL Server. |
 | **Step into called code** | Follow execution into called stored procedures, scalar functions, and **dynamic SQL** (`sp_executesql`, `EXEC(@sql)`). |
+| **Trace a whole run** | The *Trace T-SQL Script* button runs to completion with no stops and prints one Debug Console line per executed statement — location (clickable when the statement is in your script or a sourceMap-matched file), variable changes, output, result sets — stepping into everything, plus a full machine-readable trace file (JSONL). |
 | **Call stack** | The full frame stack; select any frame to inspect its own locals. |
 | **Variables** | **Locals**, a **Temp Tables** scope to browse `#temp` / `@table` contents, and a **System** scope (`@@TRANCOUNT`, `XACT_STATE()`, `@@SPID`, SET options). |
 | **Watch, hover & edit** | Watch expressions, hover-to-evaluate, and **Set Value** to change a local mid-run. |
@@ -236,6 +237,7 @@ to your database.
 | `procedure` | string | — | Two/three-part name; required for `mode: procedure`. |
 | `args` | object | `{}` | Parameter → T-SQL literal, e.g. `{ "@Id": "42" }` (procedure mode). |
 | `stopOnEntry` * | boolean | `true` | Stop at the first statement before running. |
+| `traceRun` | boolean \| object | `false` | Run to completion with **no stops** (breakpoints/`stopOnEntry` ignored), streaming a per-statement trace to the Debug Console and writing a JSONL trace file. Options: `{ "stepMode": "over"\|"into", "captureTempRowCounts": false, "variableCapture": "changed"\|"full", "file": "path" }`. The *Trace T-SQL Script* button uses `stepMode: "into"`. Rolls back unless `commitMode: "commit"` **and** the run completed (then the usual confirmation modal). |
 | `commitMode` | `rollback` \| `commit` | `rollback` | `commit` keeps changes after a confirmed Stop. |
 | `authType` | `integrated` \| `sql` | `integrated` | Windows (SSPI) or a SQL login. Best set in the Connection Manager. |
 | `sqlUser` | string | — | SQL login name (when `authType: sql`). The **password is never a config field** — it lives in SecretStorage; set it in the Connection Manager. |
