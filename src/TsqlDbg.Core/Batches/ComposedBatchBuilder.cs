@@ -313,7 +313,7 @@ public static class ComposedBatchBuilder
         // §5.3 source slice (and therefore PatchedText) drops it. Recover the keyword before it
         // reaches the CASE-WHEN shell, else the shell is a scalar subquery where a boolean is
         // required. See LeadingExistsKeywordDropped for the full failure mode.
-        var booleanText = LeadingExistsKeywordDropped(predicate)
+        var booleanText = LeadingExistsKeywordDropped(predicate) && !StartsWithExistsKeyword(rewrite.PatchedText)
             ? "EXISTS " + rewrite.PatchedText
             : rewrite.PatchedText;
         var text = $"SELECT CASE WHEN {booleanText} THEN 1 ELSE 0 END AS p;";
@@ -350,6 +350,31 @@ public static class ComposedBatchBuilder
                     return false;
             }
         }
+    }
+
+    // Defensive guard (independent review 2026-07-23, LOW-1): the recovery above assumes the
+    // pinned ScriptDom (180.37.3) EXCLUDES the EXISTS keyword from the fragment span — verified
+    // true today. Should a future ScriptDom upgrade ever INCLUDE the keyword, the StartOffset
+    // equality in LeadingExistsKeywordDropped would still hold (the parent still inherits the
+    // first child's offset) while the slice ALREADY carried "EXISTS", and the prepend would
+    // manufacture "EXISTS EXISTS" — a fresh Msg 4145. So never prepend when the already-patched
+    // text opens with the keyword. Current ScriptDom cannot reach this branch (a dropped-keyword
+    // slice starts with '('), so it is pure future-proofing, not exercised by the corpus.
+    private static bool StartsWithExistsKeyword(string text)
+    {
+        var i = 0;
+        while (i < text.Length && char.IsWhiteSpace(text[i]))
+        {
+            i++;
+        }
+        if (string.Compare(text, i, "EXISTS", 0, 6, StringComparison.OrdinalIgnoreCase) != 0)
+        {
+            return false;
+        }
+        // Require a token boundary so an identifier like "EXISTSFLAG" is not mistaken for the
+        // keyword (EXISTS is followed by whitespace or '(' in a real predicate slice).
+        var after = i + 6;
+        return after >= text.Length || !(char.IsLetterOrDigit(text[after]) || text[after] == '_');
     }
 
     // §6 RETURN-value capture (and the natural shell for §12.4 watch / §13 logpoint

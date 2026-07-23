@@ -256,6 +256,9 @@ public class ComposedBatchBuilderTests
             frame, RewriteEngine.CreateDefault(), new RewriteContext("ab12"), predicate, script, ShadowValues.Initial());
 
         Assert.Contains(expectedShell, batch.Text);
+        // The recovery path prepends exactly one keyword — never a doubled "EXISTS EXISTS"
+        // (LOW-1 guard: no prepend when the slice already opens with EXISTS).
+        Assert.DoesNotContain("EXISTS EXISTS", batch.Text);
     }
 
     // Unaffected forms keep ScriptDom's leading token and must NOT get a spurious second EXISTS:
