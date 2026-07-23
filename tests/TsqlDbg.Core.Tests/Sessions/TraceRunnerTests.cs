@@ -96,6 +96,14 @@ public sealed class TraceRunnerTests
         Assert.Empty(steps[2].VariablesChanged!);
         Assert.Equal(new[] { 1, 2, 3 }, steps.Select(s => s.Seq));
         Assert.All(steps, s => Assert.Null(s.Error));
+        // A74 rider: every record carries its pre-step stack — one root entry here, at the
+        // statement's own line (a caller entry would sit below with its call-site line).
+        Assert.All(steps, s =>
+        {
+            var entry = Assert.Single(s.Stack);
+            Assert.Equal(s.FrameOrdinal, entry.FrameId);
+            Assert.Equal(s.Line, entry.Line);
+        });
     }
 
     [Fact]

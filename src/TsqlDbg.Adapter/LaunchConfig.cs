@@ -149,7 +149,7 @@ public sealed record LaunchConfig(
 
         if (token.Type == JTokenType.Boolean)
         {
-            return token.Value<bool>() ? new TraceRunConfig(StepKind.Over, false, false, null) : null;
+            return token.Value<bool>() ? new TraceRunConfig(StepKind.Over, false, false, null, TraceView.Console) : null;
         }
 
         if (token is not JObject obj)
@@ -169,11 +169,25 @@ public sealed record LaunchConfig(
                     : throw new ProtocolLaunchException(
                         $"launch config 'traceRun.variableCapture' must be 'changed' or 'full', not '{variableCapture}'.");
 
+        // DESIGN §17 (A74): "console" (default — a bare DAP client is never silently mute)
+        // | "panel" (custom trace events for the extension's webview). Unrecognized REFUSES,
+        // same discipline as variableCapture: a silently-wrong projection is worse than a
+        // failed launch.
+        var viewText = obj.Value<string>("view");
+        var view =
+            string.IsNullOrEmpty(viewText) || viewText.Equals("console", StringComparison.OrdinalIgnoreCase)
+                ? TraceView.Console
+                : viewText.Equals("panel", StringComparison.OrdinalIgnoreCase)
+                    ? TraceView.Panel
+                    : throw new ProtocolLaunchException(
+                        $"launch config 'traceRun.view' must be 'console' or 'panel', not '{viewText}'.");
+
         return new TraceRunConfig(
             kind,
             obj.Value<bool?>("captureTempRowCounts") ?? false,
             fullCapture,
-            obj.Value<string>("file"));
+            obj.Value<string>("file"),
+            view);
     }
 
     private static string RequireString(IDictionary<string, JToken> properties, string key)
@@ -215,12 +229,21 @@ public sealed record LaunchConfig(
 }
 
 // DESIGN §17 (A73): the parsed traceRun options — §24.4 trace_* knobs on the launch surface,
-// plus an optional explicit trace-file path (else a timestamped file under the OS temp dir).
+// plus an optional explicit trace-file path (else a timestamped file under the OS temp dir)
+// and the A74 client projection (console line stream vs custom trace events for the panel).
 public sealed record TraceRunConfig(
     StepKind StepMode,
     bool CaptureTempRowCounts,
     bool FullVariableCapture,
-    string? File);
+    string? File,
+    TraceView View);
+
+// DESIGN §17 (A74): which client projection a trace run streams.
+public enum TraceView
+{
+    Console,
+    Panel,
+}
 
 // Thin marker so LaunchConfig.Parse doesn't need a dependency on the DAP library's
 // ProtocolException; TsqlDbgDebugSession translates this to one at the DAP boundary.

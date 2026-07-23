@@ -1,0 +1,334 @@
+/* DESIGN §17 (A74): the T-SQL Trace panel — a dumb renderer of the adapter's
+   tsqldbg_trace* events. All colors come from VS Code theme variables so the panel
+   follows light/dark/high-contrast without any theme logic of its own. */
+
+:root {
+	--pad: 6px;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+	font-family: var(--vscode-font-family);
+	font-size: var(--vscode-font-size);
+	color: var(--vscode-foreground);
+	background: var(--vscode-editor-background);
+}
+
+#app {
+	display: flex;
+	flex-direction: column;
+	height: 100vh;
+}
+
+/* ---- header bar -------------------------------------------------------- */
+
+#meta {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: var(--pad) 10px;
+	border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+	flex: 0 0 auto;
+	white-space: nowrap;
+	overflow: hidden;
+}
+
+#meta .target {
+	font-weight: 600;
+}
+
+#meta .dim {
+	opacity: 0.75;
+}
+
+#meta .status {
+	margin-left: auto;
+	padding: 1px 8px;
+	border-radius: 8px;
+	font-size: 0.9em;
+	background: var(--vscode-badge-background);
+	color: var(--vscode-badge-foreground);
+}
+
+#meta .status.completed {
+	background: var(--vscode-testing-iconPassed, #388a34);
+	color: var(--vscode-editor-background);
+}
+
+#meta .status.faulted,
+#meta .status.incomplete {
+	background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
+	color: var(--vscode-foreground);
+}
+
+#filter {
+	flex: 0 1 220px;
+	min-width: 90px;
+	background: var(--vscode-input-background);
+	color: var(--vscode-input-foreground);
+	border: 1px solid var(--vscode-input-border, transparent);
+	border-radius: 2px;
+	padding: 2px 6px;
+	outline: none;
+}
+
+#filter:focus {
+	border-color: var(--vscode-focusBorder);
+}
+
+/* ---- step stream ------------------------------------------------------- */
+
+#rows {
+	flex: 1 1 auto;
+	overflow: auto;
+	padding-bottom: 6px;
+}
+
+.step {
+	padding: 2px 10px 2px 6px;
+	border-left: 3px solid transparent;
+}
+
+.step:nth-child(odd) {
+	background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.06));
+}
+
+.step.has-error {
+	border-left-color: var(--vscode-errorForeground, #f48771);
+}
+
+.step-line {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	line-height: 1.5;
+}
+
+.seq {
+	flex: 0 0 3.2em;
+	text-align: right;
+	opacity: 0.55;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 0.9em;
+}
+
+.loc {
+	flex: 0 0 auto;
+	/* Frame-depth nesting: the row's --indent shifts the content while the seq number
+	   stays in its fixed left column. */
+	margin-left: var(--indent, 0px);
+	max-width: 30%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 0.9em;
+	opacity: 0.85;
+}
+
+a.loc {
+	color: var(--vscode-textLink-foreground);
+	text-decoration: none;
+	cursor: pointer;
+}
+
+a.loc:hover {
+	text-decoration: underline;
+}
+
+.stmt {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: var(--vscode-editor-font-size, 13px);
+	/* VS Code's default webview stylesheet gives every <code> its own textPreformat
+	   background + padding; that sits on top of the zebra stripe and makes each row
+	   look gray. The statement must inherit the row background. */
+	background: transparent;
+	color: inherit;
+	padding: 0;
+	border-radius: 0;
+}
+
+.stmt.expandable {
+	cursor: pointer;
+}
+
+.stmt .more {
+	opacity: 0.5;
+}
+
+.stmt-full {
+	margin: 2px 0 4px calc(3.2em + var(--indent, 0px));
+	padding: 4px 8px;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: var(--vscode-editor-font-size, 13px);
+	white-space: pre;
+	overflow-x: auto;
+	background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.1));
+	border-radius: 3px;
+}
+
+.deltas {
+	flex: 0 1 auto;
+	display: flex;
+	gap: 4px;
+	flex-wrap: nowrap;
+	overflow: hidden;
+}
+
+.chip {
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 0.85em;
+	padding: 0 5px;
+	border-radius: 7px;
+	white-space: nowrap;
+	background: var(--vscode-badge-background);
+	color: var(--vscode-badge-foreground);
+}
+
+.chip.warn {
+	background: var(--vscode-inputValidation-warningBackground, #664d00);
+	color: var(--vscode-foreground);
+}
+
+/* A74 rider: quiet chips — initial/baseline values (a frame's first line), referenced-but-
+   unchanged context values, and full-mode unchanged repeats. Present but visually quiet next
+   to the bright changed chips, so only real deltas draw the eye. */
+.chip.ctx {
+	background: transparent;
+	border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+	color: var(--vscode-foreground);
+	opacity: 0.65;
+}
+
+/* A74 rider: frame-entry header — the call chain, shown once when the trace steps into a
+   deeper frame (rows themselves are indented by frame depth). */
+.frame-enter {
+	font-size: 0.85em;
+	opacity: 0.6;
+	font-style: italic;
+	padding: 3px 0 1px calc(3.9em + var(--indent, 0px));
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* ---- per-step extras --------------------------------------------------- */
+
+.indent {
+	margin-left: calc(3.9em + var(--indent, 0px));
+}
+
+.print {
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 0.95em;
+	opacity: 0.9;
+	white-space: pre-wrap;
+}
+
+.note {
+	font-style: italic;
+	opacity: 0.6;
+	font-size: 0.9em;
+}
+
+.error-line {
+	color: var(--vscode-errorForeground, #f48771);
+	white-space: pre-wrap;
+	font-size: 0.95em;
+	margin: 1px 0;
+}
+
+details.rs {
+	margin: 2px 0;
+}
+
+details.rs > summary {
+	cursor: pointer;
+	opacity: 0.8;
+	font-size: 0.9em;
+	user-select: none;
+}
+
+.rs table {
+	border-collapse: collapse;
+	margin: 3px 0 5px 0;
+	font-family: var(--vscode-editor-font-family, monospace);
+	font-size: 0.95em;
+}
+
+.rs th,
+.rs td {
+	border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+	padding: 1px 8px;
+	text-align: left;
+	max-width: 40em;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.rs th {
+	background: var(--vscode-keybindingTable-headerBackground, rgba(128, 128, 128, 0.12));
+	font-weight: 600;
+}
+
+.rs .truncated {
+	opacity: 0.6;
+	font-style: italic;
+	font-size: 0.9em;
+}
+
+/* ---- summary footer ---------------------------------------------------- */
+
+#summary {
+	flex: 0 0 auto;
+	border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+	padding: var(--pad) 10px;
+	display: none;
+}
+
+#summary.visible {
+	display: block;
+}
+
+#summary .headline {
+	font-weight: 600;
+	margin-bottom: 2px;
+}
+
+#summary .headline.completed {
+	color: var(--vscode-testing-iconPassed, #388a34);
+}
+
+#summary .headline.faulted,
+#summary .headline.incomplete {
+	color: var(--vscode-errorForeground, #f48771);
+}
+
+#summary .line {
+	opacity: 0.85;
+	font-size: 0.95em;
+	white-space: pre-wrap;
+}
+
+#summary a {
+	color: var(--vscode-textLink-foreground);
+	cursor: pointer;
+	text-decoration: none;
+}
+
+#summary a:hover {
+	text-decoration: underline;
+}
+
+#empty {
+	padding: 18px 12px;
+	opacity: 0.6;
+}

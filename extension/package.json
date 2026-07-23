@@ -2,7 +2,7 @@
   "name": "tsql-step-debugger",
   "displayName": "T-SQL Step Debugger",
   "description": "Client-side, interpreter-driven step debugger for T-SQL / MSSQL (SQL Server) stored procedures, functions, and scripts — no engine-side debug support required.",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "preview": true,
   "publisher": "ibaxo",
   "license": "MIT",
@@ -291,6 +291,15 @@
                   "file": {
                     "type": "string",
                     "description": "Explicit trace-file path. Default: a timestamped .jsonl under the OS temp dir (tsqldbg-traces)."
+                  },
+                  "view": {
+                    "type": "string",
+                    "enum": [
+                      "panel",
+                      "console"
+                    ],
+                    "default": "panel",
+                    "description": "'panel' streams the trace into the T-SQL Trace results panel (the default in VS Code); 'console' prints one Debug Console line per statement instead."
                   }
                 }
               },

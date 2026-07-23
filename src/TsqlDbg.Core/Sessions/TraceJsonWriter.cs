@@ -49,7 +49,16 @@ public static class TraceJsonWriter
         {
             kind = "step",
             seq = step.Seq,
-            frame = new { id = step.FrameOrdinal, module = step.Module?.Display, line = step.Line },
+            // A74 rider (add-only): `depth` = the frame's stack depth at this statement
+            // (0 = root). `id` is the §24.5 MONOTONIC ordinal — frame identity, never
+            // depth (each GO batch / call gets the next number; ids are never reused).
+            frame = new
+            {
+                id = step.FrameOrdinal,
+                module = step.Module?.Display,
+                line = step.Line,
+                depth = step.Stack.Count > 0 ? step.Stack.Count - 1 : (int?)null,
+            },
             statement = step.StatementText,
             variablesAfter = step.VariablesAfter,
             variablesChanged = step.VariablesChanged,

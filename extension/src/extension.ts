@@ -20,13 +20,20 @@ export function activate(context: vscode.ExtensionContext): void {
 	// adapter spawn (see SAFETY note on TsqlDebugConfigurationProvider). Never persisted.
 	const ephemeralSecrets = new EphemeralSecrets();
 	const connectionStatus = new ConnectionStatusIndicator(context, store);
+	const tracePanel = new TraceRunPanel(context);
 	context.subscriptions.push(
 		vscode.debug.registerDebugConfigurationProvider('tsql', new TsqlDebugConfigurationProvider(store, mssql, ephemeralSecrets)),
 		vscode.debug.registerDebugAdapterDescriptorFactory('tsql', new TsqlDebugAdapterDescriptorFactory(context, store, ephemeralSecrets)),
 		vscode.workspace.registerTextDocumentContentProvider(TsqlSourceContentProvider.scheme, new TsqlSourceContentProvider()),
 		vscode.debug.onDidReceiveDebugSessionCustomEvent(handleCommitConfirmEvent),
+		// A74: the trace-run panel — renders the adapter's tsqldbg_trace* event stream.
+		vscode.debug.onDidReceiveDebugSessionCustomEvent((e) => tracePanel.onCustomEvent(e)),
+		tracePanel,
 		vscode.debug.onDidStartDebugSession((s) => connectionStatus.onSessionStart(s)),
 		vscode.debug.onDidTerminateDebugSession((s) => connectionStatus.onSessionEnd(s)),
+		// A74 review MED-2: an infra-faulted trace run terminates without a summary event —
+		// tell the panel so it never claims "running…" over a dead session.
+		vscode.debug.onDidTerminateDebugSession((s) => tracePanel.onSessionTerminated(s)),
 		// One-click "Debug T-SQL Script" — the editor-title button and Command Palette entry.
 		// Starts a SCRIPT-mode session on the active .sql file with no launch.json needed; the
 		// config provider below fills the connection from the Connection Manager.
@@ -321,6 +328,20 @@ class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 			config.workspaceFolder = folder.uri.fsPath;
 		}
 
+		// DESIGN §17 (A74): in VS Code a trace run renders in the T-SQL Trace panel by
+		// default — inject view:"panel" into any traceRun launch that doesn't pin a view
+		// (objectifying `traceRun: true` first). The ADAPTER's own default stays "console"
+		// so a bare DAP client is never silently mute; `view: "console"` in launch.json
+		// opts back into the Debug Console line stream.
+		if (config.traceRun === true) {
+			config.traceRun = {};
+		}
+		// === undefined, not falsy (A74 review): an explicit-but-empty view must reach the
+		// adapter untouched so both surfaces judge the same value the same way.
+		if (config.traceRun && typeof config.traceRun === 'object' && config.traceRun.view === undefined) {
+			config.traceRun.view = 'panel';
+		}
+
 		if (!config.server) {
 			// Silent auto-use: if the active .sql editor is already connected in the mssql
 			// extension, debug against that same instance with no picker (opt out via the
@@ -415,6 +436,171 @@ class TsqlDebugConfigurationProvider implements vscode.DebugConfigurationProvide
 		if (conn.password !== undefined) {
 			config.__tsqldbgSecretToken = this.secrets.put(conn.password);
 		}
+	}
+}
+
+// DESIGN §17 (A74): the T-SQL Trace panel — a webview that renders the adapter's
+// tsqldbg_traceStart/Step/Summary custom events (a trace run with view:"panel"). Dumb
+// renderer by design (CLAUDE.md "extension/ … no logic"): every payload is the adapter's
+// §24.8 line verbatim; this class only relays messages and services navigation clicks.
+// One panel, reused across runs (a new tsqldbg_traceStart resets it).
+class TraceRunPanel implements vscode.Disposable {
+	private panel: vscode.WebviewPanel | undefined;
+	// Events that arrive before the webview's script posts {type:'ready'} — messages
+	// posted into a still-loading webview are silently dropped, so buffer and flush.
+	private pending: unknown[] = [];
+	private ready = false;
+	// A74 review MED-3: the panel renders ONE run — the debug session whose
+	// tsqldbg_traceStart arrived last. Step/summary events from any other session
+	// (two parallel trace runs) are dropped instead of interleaving into one grid.
+	private activeSessionId: string | undefined;
+	private sawSummary = false;
+
+	constructor(private readonly context: vscode.ExtensionContext) {}
+
+	onCustomEvent(e: vscode.DebugSessionCustomEvent): void {
+		if (e.session.type !== 'tsql') {
+			return;
+		}
+		switch (e.event) {
+			case 'tsqldbg_traceStart':
+				this.activeSessionId = e.session.id;
+				this.sawSummary = false;
+				this.begin();
+				this.post({ type: 'start', payload: e.body });
+				break;
+			case 'tsqldbg_traceStep':
+				if (e.session.id === this.activeSessionId) {
+					this.post({ type: 'step', payload: e.body });
+				}
+				break;
+			case 'tsqldbg_traceSummary':
+				if (e.session.id === this.activeSessionId) {
+					this.sawSummary = true;
+					this.post({ type: 'summary', payload: e.body });
+				}
+				break;
+		}
+	}
+
+	// A74 review MED-2: a trace that dies on infrastructure (connection lost, the trace
+	// file unwritable) ends the session via the generic fault path, which sends no
+	// summary event — without this the panel's status badge says "running…" forever.
+	// The Debug Console has the real story; the panel just needs to stop claiming life.
+	onSessionTerminated(session: vscode.DebugSession): void {
+		if (session.type === 'tsql' && session.id === this.activeSessionId && !this.sawSummary) {
+			this.post({ type: 'ended' });
+		}
+	}
+
+	private begin(): void {
+		if (this.panel) {
+			this.panel.reveal(undefined, /* preserveFocus */ true);
+			return;
+		}
+		this.panel = vscode.window.createWebviewPanel(
+			'tsqldbgTrace',
+			'T-SQL Trace',
+			{ viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+			{
+				enableScripts: true,
+				// The panel outlives the (short) debug session and the user will tab away —
+				// keep the streamed rows alive instead of re-rendering from nothing.
+				retainContextWhenHidden: true,
+				localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')],
+			},
+		);
+		this.ready = false;
+		this.panel.onDidDispose(() => {
+			this.panel = undefined;
+			this.ready = false;
+			this.pending = [];
+		});
+		this.panel.webview.onDidReceiveMessage((m) => void this.onWebviewMessage(m));
+		this.panel.webview.html = this.buildHtml(this.panel.webview);
+	}
+
+	private post(message: unknown): void {
+		if (!this.panel) {
+			return;
+		}
+		if (!this.ready) {
+			this.pending.push(message);
+			return;
+		}
+		void this.panel.webview.postMessage(message);
+	}
+
+	private async onWebviewMessage(m: { type?: string; path?: string; line?: number }): Promise<void> {
+		if (m.type === 'ready') {
+			this.ready = true;
+			const queued = this.pending;
+			this.pending = [];
+			for (const message of queued) {
+				void this.panel?.webview.postMessage(message);
+			}
+			return;
+		}
+		if (m.type === 'navigate' && typeof m.path === 'string') {
+			await this.navigate(m.path, typeof m.line === 'number' ? m.line : 1);
+			return;
+		}
+		if (m.type === 'openTraceFile' && typeof m.path === 'string') {
+			try {
+				const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(m.path));
+				await vscode.window.showTextDocument(doc, { preview: true });
+			} catch {
+				void vscode.window.showWarningMessage(`Could not open trace file: ${m.path}`);
+			}
+			return;
+		}
+	}
+
+	// The adapter's `source.path` is either a filesystem path or a document URI (A60: an
+	// unsaved buffer's untitled: URI). A drive-letter path ("C:\…") must not be mistaken
+	// for a URI scheme.
+	private async navigate(rawPath: string, line: number): Promise<void> {
+		try {
+			const isDrivePath = /^[a-zA-Z]:[\\/]/.test(rawPath);
+			const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(rawPath);
+			const uri = !isDrivePath && hasScheme ? vscode.Uri.parse(rawPath) : vscode.Uri.file(rawPath);
+			const doc = await vscode.workspace.openTextDocument(uri);
+			const editor = await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One });
+			const pos = new vscode.Position(Math.max(0, line - 1), 0);
+			editor.selection = new vscode.Selection(pos, pos);
+			editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+		} catch {
+			void vscode.window.showWarningMessage(`Could not open ${rawPath}.`);
+		}
+	}
+
+	private buildHtml(webview: vscode.Webview): string {
+		const script = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'tracePanel.js'));
+		const style = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'tracePanel.css'));
+		const nonce = randomUUID().replace(/-/g, '');
+		return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+	content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="${style}" rel="stylesheet">
+<title>T-SQL Trace</title>
+</head>
+<body>
+<div id="app">
+	<div id="meta"><input id="filter" type="text" placeholder="Filter steps…"></div>
+	<div id="rows"><div id="empty">Waiting for a trace run…</div></div>
+	<div id="summary"></div>
+</div>
+<script nonce="${nonce}" src="${script}"></script>
+</body>
+</html>`;
+	}
+
+	dispose(): void {
+		this.panel?.dispose();
 	}
 }
 

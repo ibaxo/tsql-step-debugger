@@ -1,6 +1,7 @@
 using System.Text;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol;
 using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
+using Newtonsoft.Json.Linq;
 using TsqlDbg.Adapter.Inspection;
 using TsqlDbg.Core.Execution;
 using TsqlDbg.Core.Sessions;
@@ -2151,6 +2152,9 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         var config = _launchConfig!;
         var stepModeLabel = traceRun.StepMode == StepKind.Into ? "into" : "over";
         var captureLabel = traceRun.FullVariableCapture ? "full" : "changed";
+        // DESIGN §17 (A74): panel view streams the custom trace events instead of per-step
+        // console lines; the intro line, end-of-run block, and §24.8 file are view-independent.
+        var panelView = traceRun.View == TraceView.Panel;
 
         TraceRunResult result;
         string filePath;
@@ -2173,6 +2177,19 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
                 "breakpoints and stops are disabled in this mode.\n")
             { Category = OutputEvent.CategoryValue.Console });
 
+            if (panelView)
+            {
+                SendEvent(new TsqldbgTraceEvent(TsqldbgTraceEvent.StartEventType, new JObject
+                {
+                    ["server"] = config.Server,
+                    ["database"] = config.Database,
+                    ["mode"] = config.Mode == LaunchMode.Script ? "script" : "procedure",
+                    ["stepMode"] = stepModeLabel,
+                    ["variableCapture"] = captureLabel,
+                    ["filePath"] = filePath,
+                }), "tsqldbg_traceStart");
+            }
+
             await using var writer = new StreamWriter(filePath, append: false);
             await writer.WriteLineAsync(TraceJsonWriter.Header(
                 sessionId: null, config.Server, config.Database,
@@ -2188,9 +2205,18 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
                 new TraceRunOptions(traceRun.StepMode, traceRun.CaptureTempRowCounts, traceRun.FullVariableCapture),
                 async step =>
                 {
-                    await writer.WriteLineAsync(
-                        TraceJsonWriter.Step(step, session.MaxConsoleRows, session.DisplayValueChars)).ConfigureAwait(false);
-                    lastPrintedError = EmitTraceStep(step, lastPrintedError);
+                    var stepLine = TraceJsonWriter.Step(step, session.MaxConsoleRows, session.DisplayValueChars);
+                    await writer.WriteLineAsync(stepLine).ConfigureAwait(false);
+                    if (panelView)
+                    {
+                        // A74: the panel projection IS the file line (reparsed) — see
+                        // EmitTracePanelStep. No console line; the panel is the stream.
+                        EmitTracePanelStep(step, stepLine);
+                    }
+                    else
+                    {
+                        lastPrintedError = EmitTraceStep(step, lastPrintedError);
+                    }
                 },
                 keepAlive: null,
                 cts.Token).ConfigureAwait(false);
@@ -2204,10 +2230,20 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
                 committed = await RequestCommitConfirmationAsync().ConfigureAwait(false);
             }
 
-            await writer.WriteLineAsync(TraceJsonWriter.Summary(
+            var summaryLine = TraceJsonWriter.Summary(
                 result.ReturnCode, result.OutputParams, result.Messages,
-                TraceJsonWriter.FinalStateLabel(result.FinalState), committed, result.StepCount)).ConfigureAwait(false);
+                TraceJsonWriter.FinalStateLabel(result.FinalState), committed, result.StepCount);
+            await writer.WriteLineAsync(summaryLine).ConfigureAwait(false);
             await writer.FlushAsync().ConfigureAwait(false);
+
+            if (panelView)
+            {
+                // A74: the summary event is the §24.8 summary line plus the trace-file path
+                // (the panel outlives the console; it must be able to say where the record is).
+                var summaryPayload = ParseTraceLine(summaryLine);
+                summaryPayload["filePath"] = filePath;
+                SendEvent(new TsqldbgTraceEvent(TsqldbgTraceEvent.SummaryEventType, summaryPayload), "tsqldbg_traceSummary");
+            }
         }
         catch (Exception ex)
         {
@@ -2293,6 +2329,54 @@ public sealed class TsqlDbgDebugSession : DebugAdapterBase
         }
 
         return step.Error;
+    }
+
+    // A74: the panel projection of one step — the §24.8 file line reparsed VERBATIM (the
+    // event body and the file cannot drift: they are the same bytes), plus one adapter-only
+    // field: `source` for click-to-navigate, attached under the A73 review MED-1
+    // real-file-only rule (a tsqldbg: virtual doc dies with the session; the panel doesn't).
+    private void EmitTracePanelStep(TraceStepRecord step, string stepJsonLine)
+    {
+        var payload = ParseTraceLine(stepJsonLine);
+        if (step.Module is not null)
+        {
+            var source = BuildModuleSource(step.Module);
+            if (source?.Path is { } sourcePath && !sourcePath.StartsWith(VirtualDocScheme, StringComparison.OrdinalIgnoreCase))
+            {
+                payload["source"] = new JObject { ["path"] = sourcePath, ["line"] = step.Line };
+            }
+        }
+
+        // A74 rider: the second adapter-added field — the pre-step call stack (bottom →
+        // top; callers' line = their parked call site), so the panel renders real chains
+        // like `<script>:4 → dbo.procA:5` instead of inferring depth (frame ids are the
+        // §24.5 monotonic ordinals — identity, never depth). Panel event only; the file
+        // carries the compact `frame.depth`.
+        if (step.Stack.Count > 0)
+        {
+            payload["stack"] = new JArray(step.Stack.Select(e => new JObject
+            {
+                ["id"] = e.FrameId,
+                ["module"] = e.Module,
+                ["line"] = e.Line,
+            }));
+        }
+
+        SendEvent(new TsqldbgTraceEvent(TsqldbgTraceEvent.StepEventType, payload), $"tsqldbg_traceStep seq={step.Seq}");
+    }
+
+    // A74 review MED-1: JObject.Parse's default DateParseHandling coerces any string value
+    // that LOOKS like an ISO datetime (a debuggee varchar, a PRINT message, a result cell)
+    // into a Date token, re-serialized in machine-local offset — silently different bytes
+    // than the §24.8 file line, exactly the drift the reparse-the-same-string design exists
+    // to prevent. Parse with date handling off so every string JValue survives verbatim.
+    private static JObject ParseTraceLine(string jsonLine)
+    {
+        using var reader = new Newtonsoft.Json.JsonTextReader(new StringReader(jsonLine))
+        {
+            DateParseHandling = Newtonsoft.Json.DateParseHandling.None,
+        };
+        return JObject.Load(reader);
     }
 
     // A73: the end-of-run block — the §24.8 summary projection plus the trace-file path.
@@ -3228,6 +3312,26 @@ public sealed class TsqldbgCommitConfirmEvent : DebugEvent
 
     [Newtonsoft.Json.JsonProperty("env")]
     public string Env { get; }
+}
+
+// DESIGN §17 (A74): the trace-panel stream — one event class, three wire names
+// (tsqldbg_traceStart / tsqldbg_traceStep / tsqldbg_traceSummary). The body is an
+// arbitrary JObject flattened via [JsonExtensionData], so a step event carries the §24.8
+// step line verbatim (JObject.Parse of the exact string the file writer produced) —
+// typed properties would be a second projection that could drift from the file format.
+public sealed class TsqldbgTraceEvent : DebugEvent
+{
+    public const string StartEventType = "tsqldbg_traceStart";
+    public const string StepEventType = "tsqldbg_traceStep";
+    public const string SummaryEventType = "tsqldbg_traceSummary";
+
+    public TsqldbgTraceEvent(string eventType, JObject payload) : base(eventType)
+    {
+        Payload = payload.Properties().ToDictionary(p => p.Name, p => p.Value);
+    }
+
+    [Newtonsoft.Json.JsonExtensionData]
+    public IDictionary<string, JToken> Payload { get; }
 }
 
 // The extension's reply — a custom REQUEST (client -> adapter), same registration

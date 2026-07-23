@@ -32,7 +32,14 @@ public sealed record TraceStepRecord(
     IReadOnlyList<string> Output,
     IReadOnlyList<ResultSet> ResultSets,
     TraceErrorRecord? Error,                               // only in an active error context
-    IReadOnlyList<string> Notes);
+    IReadOnlyList<string> Notes,
+    // A74 rider: the call stack AT this statement, bottom (root) → top (the executing
+    // frame), captured pre-step — frame ids are the §24.5 monotonic ordinals (NOT depth;
+    // depth = index in this list). Callers' Line is their parked call-site statement.
+    IReadOnlyList<TraceStackEntry> Stack);
+
+/// <summary>A74 rider: one frame of a step's call stack (see <see cref="TraceStepRecord.Stack"/>).</summary>
+public sealed record TraceStackEntry(int FrameId, string Module, int Line);
 
 /// <summary>DESIGN §24.5/§10 (A73): the active error at a trace step (ErrorInfo's shape).</summary>
 public sealed record TraceErrorRecord(
@@ -105,6 +112,10 @@ public static class TraceRunner
 
             var frame = session.TopFrame;
             var current = session.Current;
+            // A74 rider: the stack must be read BEFORE the step — the statement may push a
+            // callee (its record still belongs to the caller's chain) or pop this frame
+            // entirely (its callers would be unrecoverable afterwards).
+            var stack = CaptureStack(session);
             IReadOnlyList<ResultSet> sets;
             IReadOnlyList<string> msgs;
             try
@@ -164,7 +175,7 @@ public static class TraceRunner
 
             await onStep(new TraceStepRecord(
                 seq, frame?.Ordinal, frame?.Module, current?.Span.StartLine ?? 0, current?.Text,
-                vars, changed, tempCounts, msgs, sets, CurrentError(session), notes)).ConfigureAwait(false);
+                vars, changed, tempCounts, msgs, sets, CurrentError(session), notes, stack)).ConfigureAwait(false);
         }
 
         var returnCode = session.Frames.Count > 0 ? session.Frames[0].ReturnCode : 0;
@@ -173,6 +184,20 @@ public static class TraceRunner
             : TraceFinalState.Incomplete;
         var outputParams = await CaptureOutputParamsAsync(session, ct).ConfigureAwait(false);
         return new TraceRunResult(returnCode, outputParams, DedupeMessages(messages), finalState, seq);
+    }
+
+    // A74 rider: bottom → top; a non-top frame's Cursor.Current is its parked call-site
+    // statement, so its Line is where the call chain descended from that frame.
+    private static IReadOnlyList<TraceStackEntry> CaptureStack(Session session)
+    {
+        var frames = session.Frames;
+        var stack = new List<TraceStackEntry>(frames.Count);
+        foreach (var f in frames)
+        {
+            stack.Add(new TraceStackEntry(f.Ordinal, f.Module.Display, f.Cursor.Current?.Span.StartLine ?? 0));
+        }
+
+        return stack;
     }
 
     private static async Task<Dictionary<string, string>> CaptureVariablesAsync(

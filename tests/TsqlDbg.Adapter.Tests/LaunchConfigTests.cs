@@ -100,6 +100,7 @@ public sealed class LaunchConfigTests
         Assert.False(traceRun.CaptureTempRowCounts);
         Assert.False(traceRun.FullVariableCapture);             // "changed" (§24.8/A70)
         Assert.Null(traceRun.File);
+        Assert.Equal(TraceView.Console, traceRun.View);         // A74: adapter default — never silently mute
     }
 
     [Fact]
@@ -135,6 +136,30 @@ public sealed class LaunchConfigTests
         // than a failed launch.
         var properties = BaseProperties();
         properties["traceRun"] = JObject.Parse("{ \"variableCapture\": \"delta\" }");
+
+        Assert.Throws<ProtocolLaunchException>(() => LaunchConfig.Parse(properties));
+    }
+
+    [Fact]
+    public void Parse_TraceRunView_DefaultsConsole_ParsesPanelCaseInsensitively()
+    {
+        // A74: absent -> Console (the raw-DAP-safe default); "panel" opts into the
+        // custom-event stream, case-insensitively like every other launch enum.
+        var properties = BaseProperties();
+        properties["traceRun"] = JObject.Parse("{ \"stepMode\": \"into\" }");
+        Assert.Equal(TraceView.Console, LaunchConfig.Parse(properties).TraceRun!.View);
+
+        properties["traceRun"] = JObject.Parse("{ \"view\": \"Panel\" }");
+        Assert.Equal(TraceView.Panel, LaunchConfig.Parse(properties).TraceRun!.View);
+    }
+
+    [Fact]
+    public void Parse_TraceRunUnrecognizedView_RefusesTheLaunch()
+    {
+        // A74: same discipline as variableCapture — a silently-wrong projection (the user
+        // expects the panel, nothing appears) is worse than a failed launch.
+        var properties = BaseProperties();
+        properties["traceRun"] = JObject.Parse("{ \"view\": \"grid\" }");
 
         Assert.Throws<ProtocolLaunchException>(() => LaunchConfig.Parse(properties));
     }
