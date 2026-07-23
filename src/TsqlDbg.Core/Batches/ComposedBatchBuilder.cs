@@ -308,10 +308,48 @@ public static class ComposedBatchBuilder
         BatchComposition? composition = null)
     {
         var rewrite = rewriteEngine.Rewrite(predicate, fullScript, rewriteContext);
-        var text = $"SELECT CASE WHEN {rewrite.PatchedText} THEN 1 ELSE 0 END AS p;";
+        // ScriptDom quirk (GitHub #2, verified 2026-07-23): an ExistsPredicate's fragment
+        // span begins at its subquery's '(' — the leading EXISTS keyword is EXCLUDED — so the
+        // §5.3 source slice (and therefore PatchedText) drops it. Recover the keyword before it
+        // reaches the CASE-WHEN shell, else the shell is a scalar subquery where a boolean is
+        // required. See LeadingExistsKeywordDropped for the full failure mode.
+        var booleanText = LeadingExistsKeywordDropped(predicate)
+            ? "EXISTS " + rewrite.PatchedText
+            : rewrite.PatchedText;
+        var text = $"SELECT CASE WHEN {booleanText} THEN 1 ELSE 0 END AS p;";
         return Build(frame, rewriteContext, text, rewrite.RequiredShadows, shadowValues,
             (composition ?? BatchComposition.Default) with { IncludeStateWrite = false, IncludeStateSnapshot = false },
             CollectTvpArguments(predicate, frame));
+    }
+
+    // GitHub #2: ScriptDom sets an ExistsPredicate's StartOffset to its subquery's '(' rather
+    // than to the leading EXISTS keyword. Because a parent boolean node inherits its first
+    // child's StartOffset, the omission bubbles up to ANY predicate whose LEFTMOST leaf is a
+    // bare EXISTS (e.g. `EXISTS(...) AND @x = 1`). The §6 predicate shell
+    // `SELECT CASE WHEN <slice> THEN 1 ELSE 0 END` then becomes `... WHEN (SELECT ...) THEN ...`
+    // — a scalar subquery where a boolean is expected — which the server rejects with Msg 4145
+    // ("An expression of non-boolean type ... near 'THEN'"). NOT EXISTS (slice starts at NOT),
+    // parenthesized `(EXISTS ...)` (slice starts at '('), and a non-leftmost EXISTS
+    // (`@x = 1 AND EXISTS(...)`) all keep their leading token and are unaffected. The
+    // StartOffset equality guard confirms the dropped EXISTS sits at the very start of the
+    // slice, so prepending "EXISTS " to the already-patched text reconstructs the boolean
+    // exactly (a pure string concat — no §7.4 span-offset interaction).
+    private static bool LeadingExistsKeywordDropped(BooleanExpression predicate)
+    {
+        var node = predicate;
+        while (true)
+        {
+            switch (node)
+            {
+                case ExistsPredicate exists:
+                    return exists.StartOffset == predicate.StartOffset;
+                case BooleanBinaryExpression binary:
+                    node = binary.FirstExpression;
+                    continue;
+                default:
+                    return false;
+            }
+        }
     }
 
     // §6 RETURN-value capture (and the natural shell for §12.4 watch / §13 logpoint

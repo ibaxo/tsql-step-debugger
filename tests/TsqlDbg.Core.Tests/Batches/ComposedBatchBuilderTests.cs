@@ -238,6 +238,44 @@ public class ComposedBatchBuilderTests
         Assert.Contains("CASE WHEN @__dbgab12_sh_rowcount = 0 THEN 1 ELSE 0 END AS p;", batch.Text);
     }
 
+    // GitHub #2: ScriptDom sets an ExistsPredicate's StartOffset to its subquery's '(' — the
+    // leading EXISTS keyword is dropped from the source slice — so an untreated predicate shell
+    // becomes `SELECT CASE WHEN (SELECT ...) THEN ...`, a scalar subquery where a boolean is
+    // required (Msg 4145 "non-boolean type ... near 'THEN'"). BuildForPredicate must recover the
+    // keyword. The omission bubbles up to any predicate whose LEFTMOST leaf is a bare EXISTS.
+    [Theory]
+    [InlineData("IF EXISTS (SELECT 1) SELECT 1 AS x;", "CASE WHEN EXISTS (SELECT 1) THEN 1 ELSE 0 END AS p;")]
+    [InlineData("IF EXISTS (SELECT 1) AND @a = 1 SELECT 1 AS x;", "CASE WHEN EXISTS (SELECT 1) AND @a = 1 THEN 1 ELSE 0 END AS p;")]
+    [InlineData("IF EXISTS (SELECT 1) OR EXISTS (SELECT 2) SELECT 1 AS x;", "CASE WHEN EXISTS (SELECT 1) OR EXISTS (SELECT 2) THEN 1 ELSE 0 END AS p;")]
+    public void BuildForPredicate_LeadingExists_RecoversDroppedKeyword(string bodySql, string expectedShell)
+    {
+        var frame = FrameWithVar(bodySql, "DECLARE @a int;", "@a", "int", out var script);
+        var predicate = ((Microsoft.SqlServer.TransactSql.ScriptDom.IfStatement)frame.Cursor.Index.All[0].Fragment).Predicate;
+
+        var batch = ComposedBatchBuilder.BuildForPredicate(
+            frame, RewriteEngine.CreateDefault(), new RewriteContext("ab12"), predicate, script, ShadowValues.Initial());
+
+        Assert.Contains(expectedShell, batch.Text);
+    }
+
+    // Unaffected forms keep ScriptDom's leading token and must NOT get a spurious second EXISTS:
+    // NOT EXISTS (slice starts at NOT), parenthesized (slice starts at '('), non-leftmost EXISTS.
+    [Theory]
+    [InlineData("IF NOT EXISTS (SELECT 1) SELECT 1 AS x;", "CASE WHEN NOT EXISTS (SELECT 1) THEN 1 ELSE 0 END AS p;")]
+    [InlineData("IF (EXISTS (SELECT 1)) SELECT 1 AS x;", "CASE WHEN (EXISTS (SELECT 1)) THEN 1 ELSE 0 END AS p;")]
+    [InlineData("IF @a = 1 AND EXISTS (SELECT 1) SELECT 1 AS x;", "CASE WHEN @a = 1 AND EXISTS (SELECT 1) THEN 1 ELSE 0 END AS p;")]
+    public void BuildForPredicate_NonLeadingExists_LeftUntouched(string bodySql, string expectedShell)
+    {
+        var frame = FrameWithVar(bodySql, "DECLARE @a int;", "@a", "int", out var script);
+        var predicate = ((Microsoft.SqlServer.TransactSql.ScriptDom.IfStatement)frame.Cursor.Index.All[0].Fragment).Predicate;
+
+        var batch = ComposedBatchBuilder.BuildForPredicate(
+            frame, RewriteEngine.CreateDefault(), new RewriteContext("ab12"), predicate, script, ShadowValues.Initial());
+
+        Assert.Contains(expectedShell, batch.Text);
+        Assert.DoesNotContain("EXISTS EXISTS", batch.Text);
+    }
+
     [Fact]
     public void BuildForScalarEval_ParenthesizesExpression_OmitsStateWrite()
     {
